@@ -81,11 +81,15 @@ db.prepare(`INSERT INTO recurring_patterns (customer_id, pattern_type, frequency
 );
 
 // Settings (defaults)
-db.prepare(`INSERT INTO settings (key, value) VALUES ('ai_high_provider', 'codex')`).run();
+db.prepare(`INSERT INTO settings (key, value) VALUES ('ai_high_provider', 'minimax')`).run();
 db.prepare(`INSERT INTO settings (key, value) VALUES ('ai_cheap_provider', 'minimax')`).run();
 db.prepare(`INSERT INTO settings (key, value) VALUES ('business_name', 'GeekShop Computers')`).run();
+db.prepare(`INSERT INTO settings (key, value) VALUES ('business_email', 'byron@geekshop.ca')`).run();
 db.prepare(`INSERT INTO settings (key, value) VALUES ('booking_slug', 'general')`).run();
 db.prepare(`INSERT INTO settings (key, value) VALUES ('booking_title', 'Book a GeekShop appointment')`).run();
+// Billing defaults: BC GST+PST, $125/hr labour. Change in Settings → Billing & tax.
+db.prepare(`INSERT INTO settings (key, value) VALUES ('default_tax_model', 'gst_pst_bc')`).run();
+db.prepare(`INSERT INTO settings (key, value) VALUES ('labour_rate_cents_per_hour', '12500')`).run();
 
 console.log(`Seeded demo data into ${dbPath}`);
 console.log(`  - 3 customers (Linda, Brian, Powell River Computers)`);

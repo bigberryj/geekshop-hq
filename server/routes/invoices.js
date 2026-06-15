@@ -4,12 +4,30 @@
 
 import { sendEmail } from '../lib/email.js';
 import { renderInvoiceText, renderInvoiceHtml } from '../lib/invoice-renderer.js';
+import {
+  computeInvoiceTotals,
+  applyLabourRate,
+  DEFAULT_TAX_MODEL,
+  getTaxModel,
+} from '../lib/tax.js';
 
 function nextInvoiceUid(db) {
   const year = new Date().getFullYear();
   const last = db.prepare("SELECT invoice_uid FROM invoices WHERE invoice_uid LIKE ? ORDER BY id DESC LIMIT 1").get(`INV-${year}-%`);
   const n = last ? Number(last.invoice_uid.split('-')[2]) + 1 : 1;
   return `INV-${year}-${String(n).padStart(3, '0')}`;
+}
+
+// Read a setting with a sane default — never returns null/undefined.
+function readSetting(db, key, fallback) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row?.value ?? fallback;
+}
+
+function intCents(v) {
+  if (v == null) return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.round(n) : null;
 }
 
 export async function invoiceRoutes(app) {
@@ -30,19 +48,75 @@ export async function invoiceRoutes(app) {
 
   // Create
   app.post('/api/invoices', async (req, reply) => {
-    const { customer_id, line_items, tax_cents, due_at, notes } = req.body || {};
+    const { customer_id, line_items, tax_model, tax_cents_override, due_at, notes } = req.body || {};
     if (!customer_id || !Array.isArray(line_items) || !line_items.length) {
       return reply.code(400).send({ error: 'customer_id and line_items required' });
     }
-    const subtotal = line_items.reduce((s, li) => s + (li.qty || 1) * (li.unit_price || 0), 0);
-    const tax = tax_cents ?? Math.round(subtotal * 0.05);
-    const total = subtotal + tax;
+
+    // Tax model: per-invoice override > default setting > code default.
+    const defaultModel = readSetting(app.db, 'default_tax_model', DEFAULT_TAX_MODEL);
+    const effectiveModel = tax_model || defaultModel;
+    const overrideCents = intCents(tax_cents_override);
+
+    const totals = computeInvoiceTotals({
+      model: effectiveModel,
+      lineItems: line_items,
+      tax_cents_override: overrideCents,
+    });
+
     const uid = nextInvoiceUid(app.db);
     const info = app.db.prepare(`
       INSERT INTO invoices (invoice_uid, customer_id, line_items, subtotal_cents, tax_cents, total_cents, due_at, notes)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(uid, customer_id, JSON.stringify(line_items), subtotal, tax, total, due_at || null, notes || null);
-    return { id: info.lastInsertRowid, invoice_uid: uid, subtotal_cents: subtotal, tax_cents: tax, total_cents: total };
+    `).run(uid, customer_id, JSON.stringify(line_items), totals.subtotal_cents, totals.tax_cents, totals.total_cents, due_at || null, notes || null);
+    return {
+      id: info.lastInsertRowid,
+      invoice_uid: uid,
+      ...totals,
+    };
+  });
+
+  // Pre-fill helper: take a customer's un-invoiced time entries and convert
+  // them into invoice line items at the configured labour rate.
+  // Body: { customer_id, tax_model? }
+  app.post('/api/invoices/draft-from-time', async (req, reply) => {
+    const { customer_id, tax_model } = req.body || {};
+    if (!customer_id) return reply.code(400).send({ error: 'customer_id required' });
+
+    const rate = intCents(readSetting(app.db, 'labour_rate_cents_per_hour', 10000)); // default $100/h
+    const entries = app.db.prepare(`
+      SELECT te.id, te.started_at, te.stopped_at, te.duration_seconds, te.note
+      FROM time_entries te
+      JOIN tickets t ON te.ticket_id = t.id
+      WHERE t.customer_id = ? AND te.duration_seconds IS NOT NULL
+        AND te.invoiced_at IS NULL
+      ORDER BY te.started_at ASC
+    `).all(customer_id);
+
+    const lineItems = applyLabourRate(entries, { rate_cents_per_hour: rate });
+    if (!lineItems.length) {
+      return reply.code(400).send({ error: 'no uninvoiced time entries for this customer' });
+    }
+    const defaultModel = readSetting(app.db, 'default_tax_model', DEFAULT_TAX_MODEL);
+    const totals = computeInvoiceTotals({
+      model: tax_model || defaultModel,
+      lineItems,
+    });
+    return { line_items: lineItems, ...totals, rate_cents_per_hour: rate };
+  });
+
+  // Mark selected time entries as invoiced (call after a successful create).
+  // Body: { time_entry_ids: number[] }
+  app.post('/api/time-entries/mark-invoiced', async (req, reply) => {
+    const { time_entry_ids } = req.body || {};
+    if (!Array.isArray(time_entry_ids) || !time_entry_ids.length) {
+      return reply.code(400).send({ error: 'time_entry_ids required' });
+    }
+    const placeholders = time_entry_ids.map(() => '?').join(',');
+    const info = app.db.prepare(
+      `UPDATE time_entries SET invoiced_at = CURRENT_TIMESTAMP WHERE id IN (${placeholders}) AND invoiced_at IS NULL`
+    ).run(...time_entry_ids);
+    return { ok: true, updated: info.changes };
   });
 
   // Detail
@@ -64,7 +138,22 @@ export async function invoiceRoutes(app) {
       WHERE i.id = ?
     `).get(req.params.id);
     if (!inv) return reply.code(404).type('text/html').send('<h1>Invoice not found</h1>');
-    return reply.type('text/html; charset=utf-8').send(renderInvoiceHtml({ ...inv, line_items: JSON.parse(inv.line_items) }));
+    // Re-derive the tax breakdown from the persisted subtotal so the print
+    // page is correct even for older invoices that predate the
+    // tax_lines column being saved. We re-run the configured model so
+    // changing the default tax model later still shows the right numbers.
+    const persisted = JSON.parse(inv.line_items || '[]');
+    const model = readSetting(app.db, 'default_tax_model', DEFAULT_TAX_MODEL);
+    const totals = computeInvoiceTotals({ model, lineItems: persisted });
+    return reply.type('text/html; charset=utf-8').send(renderInvoiceHtml({
+      ...inv,
+      line_items: persisted,
+      tax_lines: totals.tax_lines,
+      tax_cents: totals.tax_cents,
+      total_cents: totals.total_cents,
+      business_name: readSetting(app.db, 'business_name', 'GeekShop Computers'),
+      business_email: readSetting(app.db, 'business_email', 'byron@geekshop.ca'),
+    }));
   });
 
   // Send
@@ -76,7 +165,10 @@ export async function invoiceRoutes(app) {
     `).get(req.params.id);
     if (!inv) return reply.code(404).send({ error: 'not found' });
     if (!inv.customer_email) return reply.code(400).send({ error: 'customer has no email' });
-    const invoice = { ...inv, line_items: JSON.parse(inv.line_items) };
+    const persisted = JSON.parse(inv.line_items || '[]');
+    const model = readSetting(app.db, 'default_tax_model', DEFAULT_TAX_MODEL);
+    const totals = computeInvoiceTotals({ model, lineItems: persisted });
+    const invoice = { ...inv, line_items: persisted, tax_lines: totals.tax_lines, tax_cents: totals.tax_cents, total_cents: totals.total_cents };
     const body = `Hi ${inv.customer_name},\n\n${renderInvoiceText(invoice)}`;
     const result = await sendEmail({ to: inv.customer_email, subject: `Invoice ${inv.invoice_uid} from GeekShop Computers`, text: body });
     if (result.sent) {
