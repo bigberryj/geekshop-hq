@@ -90,9 +90,9 @@ export async function inboxRoutes(app) {
     // Create ticket
     const uid = nextTicketUid(app.db);
     const info = app.db.prepare(`
-      INSERT INTO tickets (ticket_uid, customer_id, subject, priority, source, last_message_at)
-      VALUES (?, ?, ?, ?, 'email', CURRENT_TIMESTAMP)
-    `).run(uid, customer.id, msg.subject, priority);
+      INSERT INTO tickets (ticket_uid, customer_id, subject, priority, source, source_message_id, last_message_at)
+      VALUES (?, ?, ?, ?, 'email', ?, CURRENT_TIMESTAMP)
+    `).run(uid, customer.id, msg.subject, priority, msg.messageId || null);
     app.db.prepare(`
       INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, 'customer', ?)
     `).run(info.lastInsertRowid, msg.body || msg.subject);

@@ -8,7 +8,6 @@ export default defineConfig({
     port: 5173,
     proxy: {
       '/api': 'http://localhost:5050',
-      '/book': 'http://localhost:5050',
     },
   },
 });

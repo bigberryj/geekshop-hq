@@ -48,6 +48,7 @@ export default function Money() {
                 <td className="px-3 py-2 font-mono">{formatMoney(i.total_cents)}</td>
                 <td className="px-3 py-2 text-xs">{i.due_at || '—'}</td>
                 <td className="px-3 py-2 text-right">
+                  <a className="btn-ghost text-xs" href={`/api/invoices/${i.id}/print`} target="_blank" rel="noreferrer">Print/PDF</a>
                   {i.status === 'draft' && <button className="btn-ghost text-xs" onClick={async () => { await postJson(`/invoices/${i.id}/send`, {}); load(); }}>Send</button>}
                   {i.status !== 'paid' && i.status !== 'draft' && <button className="btn-ghost text-xs" onClick={async () => { await postJson(`/invoices/${i.id}/paid`, {}); load(); }}>Mark paid</button>}
                 </td>

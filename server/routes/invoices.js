@@ -3,6 +3,7 @@
  */
 
 import { sendEmail } from '../lib/email.js';
+import { renderInvoiceText, renderInvoiceHtml } from '../lib/invoice-renderer.js';
 
 function nextInvoiceUid(db) {
   const year = new Date().getFullYear();
@@ -55,6 +56,17 @@ export async function invoiceRoutes(app) {
     return { ...inv, line_items: JSON.parse(inv.line_items) };
   });
 
+  // Printable invoice HTML. Use browser Print → Save as PDF.
+  app.get('/api/invoices/:id/print', async (req, reply) => {
+    const inv = app.db.prepare(`
+      SELECT i.*, c.name as customer_name, c.email as customer_email
+      FROM invoices i JOIN customers c ON i.customer_id = c.id
+      WHERE i.id = ?
+    `).get(req.params.id);
+    if (!inv) return reply.code(404).type('text/html').send('<h1>Invoice not found</h1>');
+    return reply.type('text/html; charset=utf-8').send(renderInvoiceHtml({ ...inv, line_items: JSON.parse(inv.line_items) }));
+  });
+
   // Send
   app.post('/api/invoices/:id/send', async (req, reply) => {
     const inv = app.db.prepare(`
@@ -64,9 +76,8 @@ export async function invoiceRoutes(app) {
     `).get(req.params.id);
     if (!inv) return reply.code(404).send({ error: 'not found' });
     if (!inv.customer_email) return reply.code(400).send({ error: 'customer has no email' });
-    const lineItems = JSON.parse(inv.line_items);
-    const lines = lineItems.map((li) => `  ${li.description} — qty ${li.qty || 1} × $${(li.unit_price / 100).toFixed(2)} = $${((li.qty || 1) * li.unit_price / 100).toFixed(2)}`).join('\n');
-    const body = `Hi ${inv.customer_name},\n\nInvoice ${inv.invoice_uid} from GeekShop Computers:\n\n${lines}\n\nSubtotal: $${(inv.subtotal_cents / 100).toFixed(2)}\nTax: $${(inv.tax_cents / 100).toFixed(2)}\nTotal: $${(inv.total_cents / 100).toFixed(2)}\n${inv.due_at ? `\nDue: ${inv.due_at}` : ''}\n\nThanks,\nGeekShop Computers\n`;
+    const invoice = { ...inv, line_items: JSON.parse(inv.line_items) };
+    const body = `Hi ${inv.customer_name},\n\n${renderInvoiceText(invoice)}`;
     const result = await sendEmail({ to: inv.customer_email, subject: `Invoice ${inv.invoice_uid} from GeekShop Computers`, text: body });
     if (result.sent) {
       app.db.prepare("UPDATE invoices SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.params.id);

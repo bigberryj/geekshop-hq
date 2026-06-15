@@ -54,12 +54,16 @@ describe('lib/ai.js', () => {
   it('aiCall returns a string from the heuristic fallback when no provider is set', async () => {
     delete process.env.OPENAI_API_KEY;
     delete process.env.GEMINI_API_KEY;
+    delete process.env.MINIMAX_API_KEY;
     const result = await aiCall('cheap_classify', 'test', { task: 'urgency_tag' });
     expect(result.output).toBe('normal');
     expect(['heuristic', 'gemini', 'minimax']).toContain(result.provider);
   });
 
   it('aiCall handles overdue classification via heuristic', async () => {
+    delete process.env.OPENAI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.MINIMAX_API_KEY;
     const result = await aiCall('cheap_classify', 'this is overdue and bad', { task: 'classify_overdue' });
     expect(result.output).toBe('overdue');
   });

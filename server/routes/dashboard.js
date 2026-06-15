@@ -9,7 +9,37 @@
  *   - EOD summary (if after 6pm)
  */
 
+import { readFileSync, existsSync } from 'node:fs';
 import { aiCall } from '../lib/ai.js';
+import { summarizeCronJobs } from '../lib/cron-status.js';
+import { readJsonSafe, readJsonlTail } from '../lib/appointment-email-state.js';
+
+const HERMES_HOME = process.env.HERMES_HOME || '/home/byron/.hermes';
+
+function readCronStatus() {
+  try {
+    const path = `${HERMES_HOME}/cron/jobs.json`;
+    if (!existsSync(path)) return { enabled_count: 0, jobs: [] };
+    return summarizeCronJobs(JSON.parse(readFileSync(path, 'utf8')));
+  } catch {
+    return { enabled_count: 0, jobs: [] };
+  }
+}
+
+function readMonitorStatus() {
+  const appointmentLog = readJsonlTail(`${HERMES_HOME}/state/appointment-email-monitor/run_log.jsonl`, 8);
+  const starredLog = readJsonlTail(`${HERMES_HOME}/state/starred-client-suggestions-log.jsonl`, 8);
+  const pendingSlots = readJsonSafe(`${HERMES_HOME}/state/appointment-email-monitor/pending_slots.json`, {});
+  return {
+    appointments: {
+      last_runs: appointmentLog,
+      pending_count: Array.isArray(pendingSlots) ? pendingSlots.length : Object.keys(pendingSlots || {}).length,
+    },
+    starred_email_suggestions: {
+      last_runs: starredLog,
+    },
+  };
+}
 
 export async function dashboardRoutes(app) {
   app.get('/api/dashboard', async (req, reply) => {
@@ -17,15 +47,22 @@ export async function dashboardRoutes(app) {
     const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
     const todayEnd = new Date(todayStart); todayEnd.setDate(todayEnd.getDate() + 1);
 
+    const { source } = req.query;
+
     // Open tickets
-    const openTickets = db.prepare(`
-      SELECT t.id, t.ticket_uid, t.subject, t.priority, t.status, t.last_message_at,
+    let openTicketSql = `
+      SELECT t.id, t.ticket_uid, t.subject, t.priority, t.status, t.source, t.source_message_id, t.last_message_at,
              c.name as customer_name, c.id as customer_id
       FROM tickets t JOIN customers c ON t.customer_id = c.id
       WHERE t.status != 'resolved'
-      ORDER BY t.priority DESC, t.last_message_at ASC
-      LIMIT 20
-    `).all();
+    `;
+    const openTicketArgs = [];
+    if (source && ['email', 'manual', 'booking'].includes(source)) {
+      openTicketSql += ' AND t.source = ?';
+      openTicketArgs.push(source);
+    }
+    openTicketSql += ' ORDER BY t.priority DESC, t.last_message_at ASC LIMIT 20';
+    const openTickets = db.prepare(openTicketSql).all(...openTicketArgs);
 
     // Today's appointments
     const todayAppts = db.prepare(`
@@ -68,6 +105,8 @@ export async function dashboardRoutes(app) {
       overdue_invoices: overdueInvoices,
       follow_up_count: followUpCount,
       top_customers: healthScores,
+      cron_status: readCronStatus(),
+      monitor_status: readMonitorStatus(),
       generated_at: new Date().toISOString(),
     };
   });

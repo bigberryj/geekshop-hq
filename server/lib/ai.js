@@ -54,6 +54,7 @@ export async function aiCall(taskClass, prompt, opts = {}) {
   for (const provider of order) {
     if (tried.has(provider)) continue;
     tried.add(provider);
+    if ((provider === 'openai' && !hasOpenaiKey()) || (provider === 'minimax' && !hasMinimaxKey())) continue;
     try {
       const result = await callProvider(provider, taskClass, prompt, opts);
       if (result) return { provider, output: result };
@@ -107,7 +108,7 @@ async function callMinimax(prompt, opts, taskClass) {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      'x-api-key': key,
+      'X-Api-Key': key,
       'anthropic-version': MINIMAX_VERSION,
     },
     body: JSON.stringify(body),

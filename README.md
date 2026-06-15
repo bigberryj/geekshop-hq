@@ -6,15 +6,17 @@ Built as a deliberate rebuild of the previous `GeekTicket` (a.k.a. `tasktrackert
 
 ## What you get
 
-- **8 pages**: Inbox, Tickets, Appointments, Customers, Money, Time, Memory search, Settings
+- **9 pages**: Inbox, Tickets, Appointments, Customers, Money, Time, Memory search, Settings, Public Booking
 - **11 DB tables** (SQLite, single file at `data/hq.db`)
-- **~32 API endpoints**
-- **2 AI features** powered by your existing subscriptions (Codex for high-reasoning, Johnny5/MiniMax for cheap/fast, Gemini as optional tertiary)
+- **~38 API endpoints**
+- **2 AI features** powered by MiniMax M3 locally, with OpenAI optional if an `OPENAI_API_KEY` is provided
 - **Self-hosted customer memory** — preferences, equipment, history, relationships, notes per customer
 - **Time tracking** per ticket (one-click start/stop)
 - **Invoices + quotes** with status tracking and overdue reminders
 - **Recurring pattern detection** (e.g. "this customer calls every 90 days")
-- **Public booking page** at `/book/<slug>` so customers can self-book
+- **Public booking page** at `/book/<slug>` with visible 90-minute available slots
+- **Printable invoices** via browser Print / Save PDF
+- **Automation status widgets** for appointment monitoring, starred-email suggestions, and Hermes cron health
 
 ## Quick start (dev)
 
@@ -49,8 +51,8 @@ cp .env.example .env
 #   NODE_ENV=production
 #   ADMIN_PASSWORD=<long-random-string>
 #   SMTP_HOST, SMTP_USER, SMTP_PASS, SMTP_FROM
-#   OPENAI_API_KEY=...  (for Codex high-reasoning tier)
-#   HERMES_AI_URL=...   (for Johnny5 / MiniMax cheap tier)
+#   MINIMAX_API_KEY=... (for AI drafts/summaries/classification)
+#   OPENAI_API_KEY=...  (optional secondary provider)
 
 # Start with a process manager (pm2, systemd, etc.)
 cd server && NODE_ENV=production node index.js
@@ -60,22 +62,22 @@ Serve the `client/dist/` directory from any static file host (nginx, Caddy, Rail
 
 ## Tech stack
 
-- **Backend:** Node.js + [Fastify 5](https://fastify.dev/) + [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) + [pino](https://getpino.io/) + [nodemailer](https://nodemailer.com/) + [OpenAI](https://www.npmjs.com/package/openai) (for Codex)
+- **Backend:** Node.js + [Fastify 5](https://fastify.dev/) + [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) + [pino](https://getpino.io/) + [nodemailer](https://nodemailer.com/) + MiniMax/OpenAI-compatible AI calls
 - **Frontend:** React 19 + [Vite 6](https://vitejs.dev/) + [TailwindCSS 3](https://tailwindcss.com/) + [lucide-react](https://lucide.dev/) + [react-router 7](https://reactrouter.com/)
 - **DB:** SQLite (WAL mode, file-based)
 - **Tests:** [Vitest](https://vitest.dev/) — 10/10 passing
 
 ## AI provider routing
 
-Two tiers, both on your existing subscriptions (zero new API bills by default):
+Two tiers, MiniMax-first:
 
 | Tier | Provider | Used for |
 |---|---|---|
-| **High-reasoning** | **Codex GPT-5.5** (ChatGPT sub) | AI reply drafts, ticket summary, memory extraction, EOD summary |
-| **Cheap / fast** | **Johnny5 (MiniMax M3)** | Overdue classification, follow-up nudges, urgency tags, health scores |
-| **Tertiary fallback** (optional) | **Gemini** | Only if you set the key and pick it |
+| **High-reasoning** | MiniMax M3 by default; OpenAI optional if `OPENAI_API_KEY` exists | AI reply drafts, ticket summaries |
+| **Cheap / fast** | MiniMax M3 | Urgency tags, simple classification |
+| **Fallback** | Local heuristic | Keeps the app usable if providers fail |
 
-Configuration in `Settings → AI provider`. Each tier has a Test button. The fallback chain per tier is `primary → secondary → local heuristic → 503`.
+Configuration is via local environment variables (`MINIMAX_API_KEY`, optional `OPENAI_API_KEY`). Secrets are never committed. The fallback chain per tier is `provider → heuristic`.
 
 ## What we kept from GeekTicket
 

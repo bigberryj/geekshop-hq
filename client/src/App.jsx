@@ -10,10 +10,12 @@ import Money from './pages/Money.jsx';
 import Time from './pages/Time.jsx';
 import Memory from './pages/Memory.jsx';
 import Settings from './pages/Settings.jsx';
+import PublicBooking from './pages/PublicBooking.jsx';
 
 export default function App() {
   return (
     <Routes>
+      <Route path="/book/:slug" element={<PublicBooking />} />
       <Route path="/" element={<Layout />}>
         <Route index element={<Inbox />} />
         <Route path="tickets" element={<Tickets />} />
