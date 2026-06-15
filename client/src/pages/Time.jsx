@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { fetchJson, formatDuration } from '../lib/api.js';
 
 export default function Time() {

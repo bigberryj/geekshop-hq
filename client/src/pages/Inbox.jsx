@@ -1,8 +1,10 @@
-import { useEffect, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState, useCallback } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { fetchJson, formatMoney } from '../lib/api.js';
 import TicketLabel from '../components/TicketLabel.jsx';
-import { AlertCircle, Clock, DollarSign, Mail, CalendarClock, Activity } from 'lucide-react';
+import GmailReviewQueue from '../components/GmailReviewQueue.jsx';
+import NewTicketModal from '../components/NewTicketModal.jsx';
+import { AlertCircle, Clock, DollarSign, Mail, CalendarClock, Activity, Plus } from 'lucide-react';
 
 const SOURCES = [
   { key: '', label: 'All' },
@@ -18,21 +20,37 @@ function latestRun(runs = []) {
 export default function Inbox() {
   const [data, setData] = useState(null);
   const [source, setSource] = useState('');
+  const [showNew, setShowNew] = useState(false);
+  const navigate = useNavigate();
 
-  useEffect(() => {
+  const loadDashboard = useCallback(() => {
     fetchJson(`/dashboard${source ? `?source=${source}` : ''}`).then(setData);
   }, [source]);
 
+  useEffect(() => { loadDashboard(); }, [loadDashboard]);
+
   if (!data) return <div>Loading…</div>;
+
+  const onImported = (result) => {
+    loadDashboard();
+    if (result?.ticket?.id) navigate(`/tickets/${result.ticket.id}`);
+  };
 
   const appointmentRun = latestRun(data.monitor_status?.appointments?.last_runs);
   const starredRun = latestRun(data.monitor_status?.starred_email_suggestions?.last_runs);
 
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-6">Inbox</h2>
+      <div className="flex items-center justify-between mb-6 gap-2">
+        <h2 className="text-2xl font-bold">Inbox</h2>
+        <button className="btn-primary flex items-center gap-1" onClick={() => setShowNew(true)}>
+          <Plus size={14} /> New ticket
+        </button>
+      </div>
 
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <GmailReviewQueue onImported={onImported} />
+
         <Stat icon={AlertCircle} label="Open requests" value={data.open_tickets.length} color="text-blue-600" />
         <Stat icon={Clock} label="Today's appointments" value={data.today_appointments.length} color="text-purple-600" />
         <Stat icon={DollarSign} label="Overdue invoices" value={`${data.overdue_invoices.length} (${formatMoney(data.overdue_invoices.reduce((s, i) => s + i.total_cents, 0))})`} color="text-red-600" />
@@ -144,6 +162,7 @@ export default function Inbox() {
           </div>
         </section>
       </div>
+      <NewTicketModal open={showNew} onClose={() => setShowNew(false)} />
     </div>
   );
 }

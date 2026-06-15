@@ -22,6 +22,7 @@ import { aiCall } from './lib/ai.js';
 import { maskSensitive } from './lib/security.js';
 import { verifySmtp } from './lib/email.js';
 import { startPoller, inboxConfig } from './lib/email-inbox.js';
+import { scanPendingEmails } from './lib/pending-emails.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -71,27 +72,21 @@ verifySmtp().then((ok) => {
 // --- Routes ---
 await registerRoutes(app, { rootDir });
 
-// --- Gmail inbox poller (auto-creates tickets for new emails) ---
+// --- Gmail inbox poller: queues new messages into pending_emails for admin review ---
 if (inboxConfig.hasCreds) {
   startPoller({
     intervalMin: inboxConfig.pollIntervalMin,
     onNewMessage: async (msg) => {
-      app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message');
-      if (!inboxConfig.autoCreate) return;
-      // Import as ticket (uses same logic as POST /api/inbox/import-as-ticket)
+      app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message queued for review');
       try {
-        const res = await app.inject({
-          method: 'POST',
-          url: '/api/inbox/import-as-ticket',
-          payload: { messageId: msg.messageId },
-        });
-        app.log.info({ status: res.statusCode, body: res.body.slice(0, 200) }, 'inbox: imported as ticket');
+        const result = await scanPendingEmails(app.db, { limit: 1 });
+        app.log.info({ inserted: result.inserted, skipped: result.skipped_existing }, 'inbox: queued');
       } catch (e) {
-        app.log.warn({ err: e.message }, 'inbox: import failed');
+        app.log.warn({ err: e.message }, 'inbox: queue failed');
       }
     },
   });
-  app.log.info({ intervalMin: inboxConfig.pollIntervalMin, autoCreate: inboxConfig.autoCreate }, 'Gmail poller started');
+  app.log.info({ intervalMin: inboxConfig.pollIntervalMin, mode: 'pending_queue' }, 'Gmail poller started');
 }
 
 // --- Graceful shutdown ---

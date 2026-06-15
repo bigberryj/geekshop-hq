@@ -2,22 +2,28 @@ import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchJson } from '../lib/api.js';
 import TicketLabel from '../components/TicketLabel.jsx';
+import NewTicketModal from '../components/NewTicketModal.jsx';
 
 export default function Tickets() {
   const [tickets, setTickets] = useState([]);
   const [status, setStatus] = useState('');
-  useEffect(() => { fetchJson(`/tickets${status ? `?status=${status}` : ''}`).then(setTickets); }, [status]);
+  const [showNew, setShowNew] = useState(false);
+  const load = () => fetchJson(`/tickets${status ? `?status=${status}` : ''}`).then(setTickets);
+  useEffect(() => { load(); }, [status]);
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex items-center justify-between mb-6 gap-2">
         <h2 className="text-2xl font-bold">Tickets</h2>
-        <select className="input w-40" value={status} onChange={(e) => setStatus(e.target.value)}>
-          <option value="">All</option>
-          <option value="open">Open</option>
-          <option value="pending">Pending</option>
-          <option value="resolved">Resolved</option>
-        </select>
+        <div className="flex items-center gap-2">
+          <select className="input w-40" value={status} onChange={(e) => setStatus(e.target.value)}>
+            <option value="">All</option>
+            <option value="open">Open</option>
+            <option value="pending">Pending</option>
+            <option value="resolved">Resolved</option>
+          </select>
+          <button className="btn-primary" onClick={() => setShowNew(true)}>+ New ticket</button>
+        </div>
       </div>
       <div className="card overflow-hidden p-0">
         <table className="w-full text-sm">
@@ -42,6 +48,7 @@ export default function Tickets() {
           </tbody>
         </table>
       </div>
+      <NewTicketModal open={showNew} onClose={() => { setShowNew(false); load(); }} />
     </div>
   );
 }
