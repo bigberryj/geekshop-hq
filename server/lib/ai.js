@@ -1,69 +1,77 @@
 /**
- * AI provider router.
+ * AI provider router — MiniMax-first (no OpenRouter, by request).
  *
- * Two tiers:
- *   - 'high_reasoning'  → Codex GPT-5.5 (your ChatGPT subscription)
- *   - 'cheap_classify'  → Johnny5 (MiniMax M3, via Hermes)
+ * Primary: MiniMax M3 via Anthropic-compatible endpoint
+ *   https://api.minimax.io/anthropic/v1/messages
+ *   Auth: x-api-key header + anthropic-version
+ *   Required env: MINIMAX_API_KEY
  *
- * Optional tertiary fallback per tier: Gemini.
+ * Optional secondary: OpenAI Platform (Codex / gpt-4o-mini)
+ *   Used only for high-reasoning if OPENAI_API_KEY is set.
+ *   NOTE: A ChatGPT Plus/Pro subscription does NOT provide OPENAI_API_KEY —
+ *   you'd need a separate OpenAI Platform account with billing, or skip this.
  *
- * Each tier is independently configurable via env or Settings (DB).
+ * Tier mapping (byron, 2026-06-15):
+ *   - 'high_reasoning' → OpenAI if available, else MiniMax M3 (max_tokens=800)
+ *   - 'cheap_classify' → MiniMax M3 (max_tokens=60, terse system prompt)
+ *
+ * Fallback chain (for either tier):
+ *   primary → secondary (OpenAI for high, MiniMax for cheap) → heuristic → throw
  *
  * Usage:
  *   import { aiCall } from './lib/ai.js';
- *   const draft = await aiCall('high_reasoning', prompt, { customerMemory, conversation });
+ *   const { output, provider } = await aiCall('high_reasoning', prompt, { system, maxTokens });
  *
- * Falls back gracefully:
- *   high fails  → cheap (MiniMax) → local heuristic → 503
- *   cheap fails → local heuristic → 503
+ * Health check:
+ *   import { testProvider } from './lib/ai.js';
+ *   await testProvider('high_reasoning');
  */
 
-import OpenAI from 'openai';
+const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || 'https://api.minimax.io/anthropic';
+const MINIMAX_MODEL = process.env.MINIMAX_MODEL || 'MiniMax-M3';
+const MINIMAX_VERSION = '2023-06-01';
 
-const HIGH_PROVIDER = process.env.AI_HIGH_PROVIDER || 'codex';
-const CHEAP_PROVIDER = process.env.AI_CHEAP_PROVIDER || 'minimax';
+function getMinimaxKey() { return process.env.MINIMAX_API_KEY; }
+function hasMinimaxKey() { return Boolean(getMinimaxKey()); }
 
-const openai = process.env.OPENAI_API_KEY ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY }) : null;
-const gemini = process.env.GEMINI_API_KEY ? { apiKey: process.env.GEMINI_API_KEY } : null;
+function getOpenaiKey() { return process.env.OPENAI_API_KEY; }
+function hasOpenaiKey() { return Boolean(getOpenaiKey()); }
 
 /**
- * Provider dispatch. Throws if all providers in the chain fail.
- * Local heuristics never throw — they return a string.
+ * Public entrypoint. Returns { provider, output } or throws.
  */
 export async function aiCall(taskClass, prompt, opts = {}) {
-  const primary = taskClass === 'high_reasoning' ? HIGH_PROVIDER : CHEAP_PROVIDER;
-  const fallbacks = taskClass === 'high_reasoning'
-    ? ['minimax', 'gemini', 'heuristic']
-    : ['gemini', 'heuristic'];
-
+  const errors = [];
   const tried = new Set();
 
-  for (const provider of [primary, ...fallbacks]) {
+  // Tier-specific provider order:
+  //   high: OpenAI (if key) → MiniMax → heuristic
+  //   cheap: MiniMax → heuristic
+  const order = taskClass === 'high_reasoning'
+    ? ['openai', 'minimax', 'heuristic']
+    : ['minimax', 'heuristic'];
+
+  for (const provider of order) {
     if (tried.has(provider)) continue;
     tried.add(provider);
     try {
-      const result = await callProvider(provider, prompt, opts);
+      const result = await callProvider(provider, taskClass, prompt, opts);
       if (result) return { provider, output: result };
     } catch (err) {
-      // Log and continue
-      console.warn(`[ai] ${provider} failed:`, err.message);
+      const msg = (err && err.message) || String(err);
+      errors.push(`${provider}: ${msg}`);
+      console.warn(`[ai] ${provider} failed:`, msg);
     }
   }
-  throw new Error(`All AI providers failed for task=${taskClass}`);
+  throw new Error(`All AI providers failed for task=${taskClass}: ${errors.join(' | ')}`);
 }
 
-async function callProvider(provider, prompt, opts) {
+async function callProvider(provider, taskClass, prompt, opts) {
   switch (provider) {
-    case 'codex':
     case 'openai':
-      if (!openai) throw new Error('OPENAI_API_KEY not set');
       return await callOpenAI(prompt, opts);
     case 'minimax':
-      // Hermes-routed call: POST to a Johnny5 local endpoint
-      return await callMinimax(prompt, opts);
-    case 'gemini':
-      if (!gemini) throw new Error('GEMINI_API_KEY not set');
-      return await callGemini(prompt, opts);
+      return await callMinimax(prompt, opts, taskClass);
     case 'heuristic':
       return heuristicFor(prompt, opts);
     default:
@@ -71,86 +79,127 @@ async function callProvider(provider, prompt, opts) {
   }
 }
 
-async function callOpenAI(prompt, opts) {
-  const response = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',  // or 'gpt-5' when available; gpt-4o-mini is the cheap Codex default
-    messages: [
-      { role: 'system', content: opts.system || 'You are a helpful assistant.' },
-      { role: 'user', content: prompt },
-    ],
-    max_tokens: opts.maxTokens || 800,
-    temperature: opts.temperature ?? 0.4,
-  });
-  return response.choices[0]?.message?.content?.trim() || '';
-}
+/**
+ * MiniMax M3 via Anthropic-compatible endpoint.
+ * Uses different system prompts / max_tokens per tier.
+ */
+async function callMinimax(prompt, opts, taskClass) {
+  const key = getMinimaxKey();
+  if (!key) throw new Error('MINIMAX_API_KEY not set');
 
-async function callMinimax(prompt, opts) {
-  // Hermes exposes a chat-completions-compatible endpoint.
-  // For v1 dev we fall back to a small local stub so the dev server runs
-  // even without Hermes running. Production sets HERMES_AI_URL.
-  const url = process.env.HERMES_AI_URL;
-  if (!url) {
-    // Dev fallback: skip the stub if we're not configured at all
-    // so the heuristic fallback can take over in tests.
-    throw new Error('HERMES_AI_URL not set (dev stub disabled)');
+  // Tier-specific defaults
+  const isHigh = taskClass === 'high_reasoning';
+  const maxTokens = opts.maxTokens ?? (isHigh ? 800 : 60);
+  const systemPrompt = opts.system ?? (isHigh
+    ? 'You are a helpful, precise assistant. Be concise and specific.'
+    : 'You are a classifier. Reply with the minimum answer required, exactly as instructed. No preamble.');
+
+  const url = `${MINIMAX_BASE}/v1/messages`;
+  const body = {
+    model: MINIMAX_MODEL,
+    max_tokens: maxTokens,
+    system: systemPrompt,
+    messages: [{ role: 'user', content: prompt }],
+    ...(opts.temperature !== undefined ? { temperature: opts.temperature } : {}),
+  };
+
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': key,
+      'anthropic-version': MINIMAX_VERSION,
+    },
+    body: JSON.stringify(body),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`minimax HTTP ${res.status}: ${text.slice(0, 200)}`);
   }
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ prompt, system: opts.system, maxTokens: opts.maxTokens || 400 }),
-  });
-  if (!res.ok) throw new Error(`minimax HTTP ${res.status}`);
   const data = await res.json();
-  return data.output || data.text || '';
-}
-
-async function callGemini(prompt, opts) {
-  // Minimal Gemini Flash call (gemini-1.5-flash). Truncated for brevity.
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${gemini.apiKey}`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      contents: [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: opts.maxTokens || 400, temperature: opts.temperature ?? 0.4 },
-    }),
-  });
-  if (!res.ok) throw new Error(`gemini HTTP ${res.status}`);
-  const data = await res.json();
-  return data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+  return data.content?.[0]?.text?.trim() || '';
 }
 
 /**
- * Local heuristic fallback — never throws, returns a string.
- * Used when all AI providers are down.
+ * OpenAI Platform API (gpt-4o-mini for cheap, gpt-4o for high).
+ * Only used if OPENAI_API_KEY is set.
+ */
+async function callOpenAI(prompt, opts) {
+  const key = getOpenaiKey();
+  if (!key) throw new Error('OPENAI_API_KEY not set');
+
+  const model = opts.model || 'gpt-4o-mini';
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${key}`,
+    },
+    body: JSON.stringify({
+      model,
+      messages: [
+        ...(opts.system ? [{ role: 'system', content: opts.system }] : []),
+        { role: 'user', content: prompt },
+      ],
+      max_tokens: opts.maxTokens || 800,
+      temperature: opts.temperature ?? 0.4,
+    }),
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`openai HTTP ${res.status}: ${text.slice(0, 200)}`);
+  }
+  const data = await res.json();
+  return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+/**
+ * Local heuristic — never throws, always returns a string.
+ * Used when all AI providers fail.
  */
 function heuristicFor(prompt, opts) {
-  // Simple "do the minimum useful thing" pass.
   if (opts.task === 'classify_overdue') {
     return prompt.toLowerCase().includes('overdue') ? 'overdue' : 'ok';
   }
-  if (opts.task === 'urgency_tag') {
-    return 'normal';
-  }
-  if (opts.task === 'health_score') {
-    return '50';
-  }
-  if (opts.task === 'follow_up_nudge') {
-    return 'Consider following up with this customer.';
+  if (opts.task === 'urgency_tag') return 'normal';
+  if (opts.task === 'health_score') return '50';
+  if (opts.task === 'follow_up_nudge') return 'Consider following up with this customer.';
+  if (opts.task === 'extract_memory') {
+    return JSON.stringify([{ category: 'note', key: 'bulk_import', value: prompt.slice(0, 200), confidence: 0.3 }]);
   }
   return '[heuristic] No AI available; please write a manual response.';
 }
 
 /**
- * Test a specific provider (used by the Settings "Test" button).
- * Returns { ok, latency_ms, sample }.
+ * Test a specific provider (used by Settings "Test" button).
+ * Returns { ok, provider, latency_ms, sample }.
  */
-export async function testProvider(provider) {
+export async function testProvider(taskClass = 'high_reasoning') {
   const start = Date.now();
+  const provider = taskClass === 'high_reasoning' && hasOpenaiKey() ? 'openai' : 'minimax';
   try {
-    const out = await callProvider(provider, 'Reply with the single word: PONG', { maxTokens: 20 });
-    return { ok: true, provider, latency_ms: Date.now() - start, sample: out };
+    const out = await callProvider(provider, taskClass, 'Reply with the single word: PONG', { maxTokens: 20 });
+    return { ok: true, provider, task: taskClass, latency_ms: Date.now() - start, sample: out };
   } catch (err) {
-    return { ok: false, provider, latency_ms: Date.now() - start, error: err.message };
+    return { ok: false, provider, task: taskClass, latency_ms: Date.now() - start, error: err.message };
   }
 }
+
+/**
+ * Read-only config snapshot (lazy getters so they reflect current env).
+ */
+export const config = {
+  get minimaxModel() { return process.env.MINIMAX_MODEL || MINIMAX_MODEL; },
+  get minimaxBase() { return process.env.MINIMAX_BASE_URL || MINIMAX_BASE; },
+  get hasMinimaxKey() { return hasMinimaxKey(); },
+  get hasOpenaiKey() { return hasOpenaiKey(); },
+  get providersAvailable() {
+    const out = [];
+    if (hasOpenaiKey()) out.push('openai');
+    if (hasMinimaxKey()) out.push('minimax');
+    out.push('heuristic');
+    return out;
+  },
+};
