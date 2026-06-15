@@ -15,16 +15,22 @@ import { Mail, RefreshCw, Inbox as InboxIcon, Loader2 } from 'lucide-react';
  */
 export default function GmailReviewQueue({ onImported }) {
   const [pending, setPending] = useState(null);
+  const [total, setTotal] = useState(0);
   const [scanning, setScanning] = useState(false);
   const [busyId, setBusyId] = useState(null);
   const [error, setError] = useState('');
 
   const load = useCallback(async () => {
     try {
-      setPending(await fetchJson('/inbox/pending?status=pending'));
+      const r = await fetchJson('/inbox/pending?status=pending');
+      // New shape: { items, total, ... }. Backward compat: plain array.
+      const items = Array.isArray(r) ? r : (r.items || r.rows || []);
+      setPending(items);
+      setTotal(typeof r === 'object' && r.total != null ? r.total : items.length);
     } catch (e) {
       setError(e.message);
       setPending([]);
+      setTotal(0);
     }
   }, []);
 
@@ -80,7 +86,7 @@ export default function GmailReviewQueue({ onImported }) {
       <div className="flex items-center justify-between gap-3 mb-3">
         <h3 className="font-semibold flex items-center gap-2">
           <Mail size={16} /> Gmail review queue
-          {pending && <span className="text-xs text-slate-500 font-normal">({pending.length} pending)</span>}
+          {pending && <span className="text-xs text-slate-500 font-normal">({pending.length}{total > pending.length ? ` of ${total}` : ''} pending)</span>}
         </h3>
         <button className="btn-secondary text-xs flex items-center gap-1" onClick={scan} disabled={scanning}>
           {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}

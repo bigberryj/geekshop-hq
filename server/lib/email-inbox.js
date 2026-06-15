@@ -42,20 +42,28 @@ export async function fetchUnread(limit = 25) {
   return withClient(async (client) => {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      const uids = await client.search({ unseen: true }, { uid: true });
-      if (!uids.length) return [];
-      const recent = uids.slice(-limit).reverse();
+      // Search returns *sequence numbers* (we pass uid:false deliberately).
+      // On this Gmail mailbox, FETCH with `uid: true` + a list of UIDs from
+      // SEARCH silently returns zero messages — server says "OK Success" but
+      // emits no FETCH data. Fetching by sequence-number range works.
+      // See: https://github.com/postalsys/imapflow/issues (Gmail CONDSTORE quirk)
+      const seqs = await client.search({ unseen: true });
+      if (!seqs.length) return [];
+      const recent = seqs.slice(-limit).reverse();
       const out = [];
-      const fetchOpts = { uid: true, envelope: true, source: true, flags: true, internalDate: true };
-      console.log('[inbox] fetchUnread: UIDs', recent);
-      for await (const msg of client.fetch(recent, fetchOpts)) {
-        console.log('[inbox] msg:', msg.uid, 'has source:', !!msg.source);
+      // Build a sequence-range string: "848:850"
+      const range = recent.length === 1
+        ? String(recent[0])
+        : `${recent[0]}:${recent[recent.length - 1]}`;
+      console.log('[inbox] fetchUnread: seqs', recent, 'range', range);
+      const fetchOpts = { envelope: true, source: true, flags: true, internalDate: true };
+      for await (const msg of client.fetch(range, fetchOpts)) {
         const source = msg.source;
         if (!source) continue;
         const parsed = await simpleParser(source);
         const from = parsed.from?.value?.[0];
         out.push({
-          uid: msg.uid,
+          uid: msg.uid, // still populated by the server
           messageId: parsed.messageId || String(msg.uid),
           from: from?.name || from?.address || '(unknown)',
           fromEmail: from?.address || '',

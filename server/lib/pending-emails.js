@@ -102,7 +102,7 @@ export function listPendingEmails(db, { status = 'pending', limit = 50 } = {}) {
     SELECT id, message_id, uid, from_name, from_email, subject, snippet, received_at, status, imported_ticket_id, fetched_at
     FROM pending_emails
     WHERE status = ?
-    ORDER BY fetched_at DESC
+    ORDER BY id DESC
     LIMIT ?
   `).all(status, limit);
 }

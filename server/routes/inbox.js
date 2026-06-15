@@ -42,7 +42,19 @@ export async function inboxRoutes(app) {
 
   app.get('/api/inbox/pending', async (req) => {
     const status = (req.query.status || 'pending').toString();
-    return listPendingEmails(app.db, { status, limit: 100 });
+    const limit = Math.min(Math.max(Number(req.query.limit) || 250, 1), 500);
+    const offset = Math.max(Number(req.query.offset) || 0, 0);
+    // Wrap the array in an object so we can include pagination metadata.
+    // Backward compat: existing UI reads `result.length` and `result.map(...)`,
+    // so we put the array as the `items` field, not the top-level value.
+    // If the UI is updated to consume `items`, we can drop the alias `rows`.
+    const items = listPendingEmails(app.db, { status, limit, offset });
+    return {
+      items,
+      rows: items, // alias for any client that still expects a flat array
+      total: app.db.prepare('SELECT COUNT(*) as n FROM pending_emails WHERE status = ?').get(status).n,
+      limit, offset,
+    };
   });
 
   app.post('/api/inbox/pending/:id/import', async (req, reply) => {

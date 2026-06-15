@@ -78,3 +78,45 @@ describe('pending_emails queue', () => {
     expect(customers.c).toBe(1);
   });
 });
+
+describe('pending_emails list shape (regression: 100-cap bug)', () => {
+  let db2;
+  beforeAll(async () => {
+    // Fresh in-memory DB so we control state precisely. Insert 250 messages
+    // all sharing the same fetched_at to mimic the real bug scenario.
+    db2 = await runMigrations(':memory:');
+    const stmt = db2.prepare(`
+      INSERT INTO pending_emails (message_id, uid, from_name, from_email, subject, body, snippet, received_at, status, fetched_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', '2026-06-15 18:00:00')
+    `);
+    for (let i = 0; i < 250; i++) {
+      stmt.run(`m${i}@x`, String(i), `Customer ${i}`, `c${i}@x.com`, `Subject ${i}`, 'body', 'snippet', '2026-06-15T18:00:00Z');
+    }
+  });
+
+  it('orders by id DESC (newest first), not fetched_at', () => {
+    // The prior code ordered by `fetched_at DESC`, which for messages
+    // bulk-fetched in the same call is non-deterministic. After the
+    // imapflow-uid-bug scan, all 218 messages share an identical fetched_at,
+    // so the order is fully driven by id.
+    const list = listPendingEmails(db2, { status: 'pending', limit: 100 });
+    expect(list.length).toBe(100);
+    for (let i = 1; i < list.length; i++) {
+      expect(list[i - 1].id).toBeGreaterThanOrEqual(list[i].id);
+    }
+  });
+
+  it('supports a high limit to fetch the whole queue (cap was 100)', () => {
+    // Prior cap was 100, so customer emails below the top 100 (e.g. Mary
+    // McIntyre at id ~217) were invisible in the UI.
+    const list = listPendingEmails(db2, { status: 'pending', limit: 500 });
+    expect(list.length).toBe(250);
+    for (const row of list) {
+      expect(row).toHaveProperty('id');
+      expect(row).toHaveProperty('message_id');
+      expect(row).toHaveProperty('from_email');
+      expect(row).toHaveProperty('subject');
+      expect(row).toHaveProperty('status');
+    }
+  });
+});
