@@ -66,7 +66,7 @@ export async function invoiceRoutes(app) {
     if (!inv.customer_email) return reply.code(400).send({ error: 'customer has no email' });
     const lineItems = JSON.parse(inv.line_items);
     const lines = lineItems.map((li) => `  ${li.description} — qty ${li.qty || 1} × $${(li.unit_price / 100).toFixed(2)} = $${((li.qty || 1) * li.unit_price / 100).toFixed(2)}`).join('\n');
-    const body = `Hi ${inv.customer_name},\n\nInvoice ${inv.invoice_uid} from GeekShop Computers:\n\n${lines}\n\nSubtotal: $${(inv.subtotal_cents / 100).toFixed(2)}\nTax: $${(inv.tax_cents / 100).toFixed(2)}\nTotal: $${(inv.total_cents / 100).toFixed(2)}\n${inv.due_at ? `\nDue: ${inv.due_at}` : ''}\n\nThanks for your business.\n`;
+    const body = `Hi ${inv.customer_name},\n\nInvoice ${inv.invoice_uid} from GeekShop Computers:\n\n${lines}\n\nSubtotal: $${(inv.subtotal_cents / 100).toFixed(2)}\nTax: $${(inv.tax_cents / 100).toFixed(2)}\nTotal: $${(inv.total_cents / 100).toFixed(2)}\n${inv.due_at ? `\nDue: ${inv.due_at}` : ''}\n\nThanks,\nGeekShop Computers\n`;
     const result = await sendEmail({ to: inv.customer_email, subject: `Invoice ${inv.invoice_uid} from GeekShop Computers`, text: body });
     if (result.sent) {
       app.db.prepare("UPDATE invoices SET status = 'sent', sent_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.params.id);

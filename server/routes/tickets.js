@@ -134,10 +134,10 @@ Reply with just the draft text, no preamble.`;
     app.db.prepare("UPDATE tickets SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.params.id);
     app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.resolve', ?)").run(req.params.id);
 
-    // Try to send resolution email
+    // Try to send resolution email (no ticket UID, no "ticket" wording — customer-facing)
     if (t.customer_email) {
-      const body = `Hi ${t.customer_name},\n\nJust confirming your ticket "${t.subject}" has been marked as resolved. Reply to this email if you need anything else.`;
-      await sendEmail({ to: t.customer_email, subject: `Resolved: ${t.subject}`, text: body });
+      const body = `Hi ${t.customer_name},\n\nJust confirming we've wrapped up your request about "${t.subject}". Reply to this email if you need anything else.`;
+      await sendEmail({ to: t.customer_email, subject: `Re: ${t.subject}`, text: body });
     }
     return { ok: true };
   });
