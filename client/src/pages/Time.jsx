@@ -35,7 +35,7 @@ export default function Time() {
             {entries.map((e) => (
               <tr key={e.id} className="border-t">
                 <td className="px-3 py-2 text-xs">{new Date(e.started_at).toLocaleString()}</td>
-                <td className="px-3 py-2 font-mono text-xs">{e.ticket_uid}</td>
+                <td className="px-3 py-2"><Link to={`/tickets/${e.ticket_id}`} className="text-brand-600 hover:underline" title={`Internal: ${e.ticket_uid}`}>{e.subject || e.ticket_uid}</Link></td>
                 <td className="px-3 py-2">{e.customer_name}</td>
                 <td className="px-3 py-2 font-mono">{formatDuration(e.duration_seconds)}</td>
                 <td className="px-3 py-2 text-slate-600 text-xs">{e.note || '—'}</td>

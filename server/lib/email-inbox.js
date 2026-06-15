@@ -102,6 +102,99 @@ export async function fetchByMessageId(messageId) {
 }
 
 /**
+ * Apply a label to a message. Creates the label if it doesn't exist (Gmail IMAP
+ * label = a folder; we use `\HasChildren` to create a real label under INBOX).
+ * Returns the path of the label that was applied (or already existed).
+ *
+ * Note: imapflow's setFlags + 'gmail-label' is the canonical way. We use a
+ * simpler approach — store the message in a folder-like mailbox, which Gmail
+ * treats as a label. This is the IMAP-equivalent of "add label X".
+ */
+export async function applyLabel({ messageId, labelPath }) {
+  if (!hasCreds()) throw new Error('Gmail creds not configured');
+  return withClient(async (client) => {
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      // 1. Find the UID by message-id header
+      const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+      if (!uids.length) return { ok: false, reason: 'message not found in INBOX' };
+      const uid = uids[0];
+
+      // 2. Make sure the label mailbox exists (Gmail auto-creates on append)
+      try {
+        await client.mailboxOpen(labelPath, { readOnly: false });
+      } catch (e) {
+        // mailboxOpen may fail if not yet created; the append below will create it
+      }
+
+      // 3. Re-open INBOX with write access and copy the message to the label
+      const inboxLock = await client.getMailboxLock('INBOX');
+      try {
+        await client.messageCopy(String(uid), labelPath, { uid: true });
+      } finally {
+        inboxLock.release();
+      }
+
+      return { ok: true, label: labelPath, uid };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/**
+ * Mark a message as read (removes the UNREAD label in Gmail) and optionally
+ * remove it from the INBOX (archive = remove INBOX label).
+ *
+ * Returns { ok, read, archived }.
+ */
+export async function markRead({ messageId, archive = false }) {
+  if (!hasCreds()) throw new Error('Gmail creds not configured');
+  return withClient(async (client) => {
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+      if (!uids.length) return { ok: false, reason: 'message not found' };
+      const uid = uids[0];
+
+      // Set \Seen flag (= Gmail's "read" state, removes UNREAD label)
+      await client.messageFlagsSet(String(uid), ['\\Seen'], { uid: true, action: 'add' });
+
+      let archived = false;
+      if (archive) {
+        // Remove from INBOX = set the \Deleted flag and expunge.
+        // Gmail treats expunge as "archive" (removes the INBOX label).
+        await client.messageFlagsSet(String(uid), ['\\Deleted'], { uid: true, action: 'add' });
+        await client.expunge({ byUid: true, uids: [String(uid)] });
+        archived = true;
+      }
+
+      return { ok: true, read: true, archived };
+    } finally {
+      lock.release();
+    }
+  });
+}
+
+/**
+ * One-shot: when a ticket is resolved, mark the original email read + apply
+ * the GeekShop/Done label + archive from INBOX. Best-effort: never throws,
+ * returns { ok, ...details } so the caller can log without breaking the
+ * resolve flow if Gmail is down.
+ */
+export async function markThreadDone(messageId) {
+  if (!messageId) return { ok: false, reason: 'no messageId' };
+  try {
+    const readResult = await markRead({ messageId, archive: true });
+    const labelResult = await applyLabel({ messageId, labelPath: 'GeekShop/Done' }).catch((e) => ({ ok: false, error: e.message }));
+    return { ok: readResult.ok, read: readResult, label: labelResult };
+  } catch (e) {
+    console.warn('[inbox] markThreadDone failed:', e.message);
+    return { ok: false, error: e.message };
+  }
+}
+
+/**
  * Test the Gmail connection. Returns { ok, latency_ms, mailbox?, error? }
  */
 export async function testConnection() {

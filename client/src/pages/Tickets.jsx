@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchJson } from '../lib/api.js';
+import TicketLabel from '../components/TicketLabel.jsx';
 
 export default function Tickets() {
   const [tickets, setTickets] = useState([]);
@@ -22,9 +23,7 @@ export default function Tickets() {
         <table className="w-full text-sm">
           <thead className="bg-slate-50 text-left">
             <tr>
-              <th className="px-3 py-2">ID</th>
               <th className="px-3 py-2">Subject</th>
-              <th className="px-3 py-2">Customer</th>
               <th className="px-3 py-2">Status</th>
               <th className="px-3 py-2">Priority</th>
               <th className="px-3 py-2">Last activity</th>
@@ -33,15 +32,13 @@ export default function Tickets() {
           <tbody>
             {tickets.map((t) => (
               <tr key={t.id} className="border-t hover:bg-slate-50">
-                <td className="px-3 py-2 font-mono text-xs">{t.ticket_uid}</td>
-                <td className="px-3 py-2"><Link to={`/tickets/${t.id}`} className="text-brand-600 hover:underline">{t.subject}</Link></td>
-                <td className="px-3 py-2">{t.customer_name}</td>
+                <td className="px-3 py-2"><TicketLabel ticket={t} /></td>
                 <td className="px-3 py-2"><span className={`badge-${t.status === 'open' ? 'green' : t.status === 'pending' ? 'yellow' : 'slate'}`}>{t.status}</span></td>
                 <td className="px-3 py-2"><span className={`badge-${t.priority === 'urgent' ? 'red' : t.priority === 'high' ? 'yellow' : 'slate'}`}>{t.priority}</span></td>
                 <td className="px-3 py-2 text-slate-500 text-xs">{t.last_message_at ? new Date(t.last_message_at).toLocaleString() : '—'}</td>
               </tr>
             ))}
-            {tickets.length === 0 && <tr><td colSpan="6" className="px-3 py-4 text-center text-slate-500">No tickets</td></tr>}
+            {tickets.length === 0 && <tr><td colSpan="4" className="px-3 py-4 text-center text-slate-500">No tickets</td></tr>}
           </tbody>
         </table>
       </div>

@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchJson, formatMoney } from '../lib/api.js';
+import TicketLabel from '../components/TicketLabel.jsx';
 import { AlertCircle, Clock, DollarSign } from 'lucide-react';
 
 export default function Inbox() {
@@ -31,7 +32,7 @@ export default function Inbox() {
                       <span className="font-medium">{t.subject}</span>
                       <span className={`badge-${t.priority === 'urgent' ? 'red' : t.priority === 'high' ? 'yellow' : 'slate'}`}>{t.priority}</span>
                     </div>
-                    <div className="text-xs text-slate-500">{t.ticket_uid} · {t.customer_name}</div>
+                    <div className="text-xs text-slate-500"><TicketLabel ticket={t} compact /></div>
                   </Link>
                 </li>
               ))}

@@ -4,6 +4,7 @@
 
 import { aiCall } from '../lib/ai.js';
 import { sendEmail } from '../lib/email.js';
+import { markThreadDone } from '../lib/email-inbox.js';
 
 function nextTicketUid(db) {
   const last = db.prepare("SELECT ticket_uid FROM tickets ORDER BY id DESC LIMIT 1").get();
@@ -139,6 +140,97 @@ Reply with just the draft text, no preamble.`;
       const body = `Hi ${t.customer_name},\n\nJust confirming we've wrapped up your request about "${t.subject}". Reply to this email if you need anything else.`;
       await sendEmail({ to: t.customer_email, subject: `Re: ${t.subject}`, text: body });
     }
-    return { ok: true };
+
+    // Best-effort: mark the original Gmail thread read + apply GeekShop/Done label + archive
+    let gmail = null;
+    if (t.source === 'email' && t.source_message_id) {
+      gmail = await markThreadDone(t.source_message_id);
+      if (gmail.ok) {
+        app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'gmail.thread.archived', ?)").run(req.params.id);
+      }
+    }
+
+    return { ok: true, gmail };
+  });
+
+  // Just send the current reply/draft to the customer as an email (no resolve)
+  app.post('/api/tickets/:id/email-reply', async (req, reply) => {
+    const { body } = req.body || {};
+    if (!body || !body.trim()) return reply.code(400).send({ error: 'body required' });
+    const t = app.db.prepare(`
+      SELECT t.*, c.email as customer_email, c.name as customer_name
+      FROM tickets t JOIN customers c ON t.customer_id = c.id
+      WHERE t.id = ?
+    `).get(req.params.id);
+    if (!t) return reply.code(404).send({ error: 'not found' });
+    if (!t.customer_email) return reply.code(400).send({ error: 'customer has no email' });
+
+    const result = await sendEmail({
+      to: t.customer_email,
+      subject: `Re: ${t.subject}`,
+      text: body.trim(),
+    });
+    if (!result.sent) return reply.code(502).send({ error: 'send failed', detail: result });
+
+    // Save the outbound message to the conversation
+    app.db.prepare(
+      'INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, ?, ?)'
+    ).run(req.params.id, 'admin', body.trim());
+    app.db.prepare('UPDATE tickets SET last_message_at = CURRENT_TIMESTAMP WHERE id = ?').run(req.params.id);
+    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.email_reply', ?)").run(req.params.id);
+
+    return { ok: true, sent: true, sent_to: t.customer_email };
+  });
+
+  // Resolve with a custom admin-written reply (the "mark done + send reply" button)
+  // Body: { reply_body: string }
+  // - Sends admin's text as the customer email (Re: <subject>)
+  // - Marks ticket resolved
+  // - Archives the Gmail thread (if source was email)
+  // - Records everything in ticket_messages + audit_log
+  app.post('/api/tickets/:id/resolve-with-reply', async (req, reply) => {
+    const { reply_body } = req.body || {};
+    if (!reply_body || !reply_body.trim()) {
+      return reply.code(400).send({ error: 'reply_body required' });
+    }
+    const t = app.db.prepare(`
+      SELECT t.*, c.email as customer_email, c.name as customer_name
+      FROM tickets t JOIN customers c ON t.customer_id = c.id
+      WHERE t.id = ?
+    `).get(req.params.id);
+    if (!t) return reply.code(404).send({ error: 'not found' });
+    if (!t.customer_email) return reply.code(400).send({ error: 'customer has no email' });
+
+    // 1. Save the admin's reply to the conversation
+    app.db.prepare(
+      'INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, ?, ?)'
+    ).run(req.params.id, 'admin', reply_body.trim());
+
+    // 2. Send the email (subject is just "Re: <subject>" so it threads with the customer's original)
+    const emailResult = await sendEmail({
+      to: t.customer_email,
+      subject: `Re: ${t.subject}`,
+      text: reply_body.trim(),
+    });
+    if (!emailResult.sent) {
+      return reply.code(502).send({ error: 'send failed', detail: emailResult });
+    }
+
+    // 3. Mark ticket resolved
+    app.db.prepare(
+      "UPDATE tickets SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, last_message_at = CURRENT_TIMESTAMP WHERE id = ?"
+    ).run(req.params.id);
+    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.resolve_with_reply', ?)").run(req.params.id);
+
+    // 4. Best-effort: archive the Gmail thread
+    let gmail = null;
+    if (t.source === 'email' && t.source_message_id) {
+      gmail = await markThreadDone(t.source_message_id);
+      if (gmail.ok) {
+        app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'gmail.thread.archived', ?)").run(req.params.id);
+      }
+    }
+
+    return { ok: true, gmail, sent_to: t.customer_email };
   });
 }

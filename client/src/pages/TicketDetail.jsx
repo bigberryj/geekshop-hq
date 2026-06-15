@@ -34,6 +34,34 @@ export default function TicketDetail() {
     } finally { setBusy(false); }
   };
 
+  // Send the current draft/reply to the customer as an email (does NOT resolve)
+  const emailReply = async (useDraft) => {
+    const body = useDraft ? draft : reply;
+    if (!body) return;
+    setBusy(true);
+    try {
+      const result = await postJson(`/tickets/${id}/email-reply`, { body });
+      if (result.sent) {
+        setReply(''); setDraft('');
+        load();
+      }
+    } finally { setBusy(false); }
+  };
+
+  // The "mark done + send reply" button — email customer + resolve + archive Gmail
+  const resolveWithReply = async (useDraft) => {
+    const body = useDraft ? draft : reply;
+    if (!body) return;
+    setBusy(true);
+    try {
+      const result = await postJson(`/tickets/${id}/resolve-with-reply`, { reply_body: body });
+      if (result.ok) {
+        setReply(''); setDraft('');
+        load();
+      }
+    } finally { setBusy(false); }
+  };
+
   const resolve = async () => {
     setBusy(true);
     try { await postJson(`/tickets/${id}/resolve`, {}); load(); } finally { setBusy(false); }
@@ -58,7 +86,23 @@ export default function TicketDetail() {
         <div>
           <h2 className="text-2xl font-bold">{ticket.subject}</h2>
           <div className="text-sm text-slate-500 mt-1">
-            {ticket.ticket_uid} · <Link to={`/customers/${ticket.customer_id}`} className="text-brand-600 hover:underline">{ticket.customer_name}</Link>
+            <Link to={`/customers/${ticket.customer_id}`} className="text-brand-600 hover:underline font-medium">{ticket.customer_name}</Link>
+            {ticket.ticket_uid && (
+              <span
+                className="ml-2 font-mono text-xs text-slate-400"
+                title={`Internal ID: ${ticket.ticket_uid} — admin reference only, never shown to customer`}
+              >
+                {ticket.ticket_uid}
+              </span>
+            )}
+            {ticket.source === 'email' && ticket.source_message_id && (
+              <span className="ml-2 text-xs text-slate-400" title={`Gmail Message-ID: ${ticket.source_message_id}`}>
+                · ✉️
+              </span>
+            )}
+            {ticket.source === 'booking' && (
+              <span className="ml-2 text-xs text-slate-400" title="Created from a public booking"> · 📅</span>
+            )}
           </div>
         </div>
         <div className="flex items-center gap-2">
@@ -116,9 +160,19 @@ export default function TicketDetail() {
           <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded">
             <div className="text-xs text-slate-500 mb-1">AI draft (click to use)</div>
             <div className="text-sm whitespace-pre-wrap">{draft}</div>
-            <button className="btn-primary mt-2" onClick={() => sendReply(true)}>
-              <Send size={14} /> Send this draft
-            </button>
+            <div className="mt-2 flex gap-2">
+              <button className="btn-secondary" onClick={() => sendReply(true)} disabled={busy}>
+                Save to convo
+              </button>
+              <button className="btn-primary" onClick={() => emailReply(true)} disabled={busy}>
+                <Send size={14} /> Email customer
+              </button>
+              {ticket.status !== 'resolved' && (
+                <button className="btn-primary bg-emerald-600 hover:bg-emerald-700" onClick={() => resolveWithReply(true)} disabled={busy}>
+                  <CheckCircle size={14} /> Reply & resolve
+                </button>
+              )}
+            </div>
           </div>
         )}
         <textarea
@@ -127,10 +181,18 @@ export default function TicketDetail() {
           value={reply}
           onChange={(e) => setReply(e.target.value)}
         />
-        <div className="mt-2 flex justify-end">
-          <button className="btn-primary" onClick={() => sendReply(false)} disabled={busy || !reply}>
-            <Send size={14} /> Send
+        <div className="mt-2 flex justify-end gap-2">
+          <button className="btn-secondary" onClick={() => sendReply(false)} disabled={busy || !reply}>
+            Save to convo
           </button>
+          <button className="btn-primary" onClick={() => emailReply(false)} disabled={busy || !reply}>
+            <Send size={14} /> Email customer
+          </button>
+          {ticket.status !== 'resolved' && (
+            <button className="btn-primary bg-emerald-600 hover:bg-emerald-700" onClick={() => resolveWithReply(false)} disabled={busy || !reply}>
+              <CheckCircle size={14} /> Reply & resolve
+            </button>
+          )}
         </div>
       </div>
     </div>
