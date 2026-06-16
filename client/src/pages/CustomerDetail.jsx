@@ -1,9 +1,131 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { fetchJson, postJson, delJson, formatDuration, formatMoney } from '../lib/api.js';
-import { Sparkles, Plus, Trash2 } from 'lucide-react';
+import { fetchJson, postJson, putJson, delJson, formatDuration, formatMoney } from '../lib/api.js';
+import { Sparkles, Plus, Trash2, Pencil, X, Check, Loader2 } from 'lucide-react';
 
 const CATEGORIES = ['preference', 'equipment', 'history', 'relationship', 'note'];
+
+function EditableContact({ customer, onSaved }) {
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+  const [form, setForm] = useState({
+    name: customer.name || '',
+    company: customer.company || '',
+    email: customer.email || '',
+    phone: customer.phone || '',
+    notes: customer.notes || '',
+  });
+
+  // Reset form when customer data changes (e.g. after save).
+  useEffect(() => {
+    if (!editing) {
+      setForm({
+        name: customer.name || '',
+        company: customer.company || '',
+        email: customer.email || '',
+        phone: customer.phone || '',
+        notes: customer.notes || '',
+      });
+    }
+  }, [customer, editing]);
+
+  const start = () => { setError(''); setEditing(true); };
+  const cancel = () => { setError(''); setEditing(false); };
+  const save = async (e) => {
+    e?.preventDefault();
+    setSaving(true);
+    setError('');
+    try {
+      // Only send fields that actually changed so the audit log is clean.
+      const changed = {};
+      for (const k of Object.keys(form)) {
+        const prev = (customer[k] || '') + '';
+        const next = (form[k] || '') + '';
+        if (prev !== next) changed[k] = form[k];
+      }
+      if (Object.keys(changed).length === 0) {
+        setEditing(false);
+        return;
+      }
+      await putJson(`/customers/${customer.id}`, changed);
+      setEditing(false);
+      onSaved?.();
+    } catch (err) {
+      setError(err.response?.data?.error || err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  if (!editing) {
+    return (
+      <div className="mt-2 mb-6">
+        <div className="flex items-start justify-between gap-2">
+          <div className="min-w-0">
+            <h2 className="text-2xl font-bold">{customer.name}</h2>
+            <div className="text-sm text-slate-500 mt-1">
+              {[
+                customer.company,
+                customer.email,
+                customer.phone,
+              ].filter(Boolean).join(' · ') || <span className="italic text-slate-400">no contact info yet</span>}
+            </div>
+            {customer.notes && <p className="text-sm text-slate-700 mt-2 whitespace-pre-wrap">{customer.notes}</p>}
+          </div>
+          <button
+            onClick={start}
+            className="btn-secondary text-xs shrink-0"
+            data-testid="customer-edit-btn"
+            title="Edit contact info"
+          >
+            <Pencil size={12} /> Edit
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <form onSubmit={save} className="mt-2 mb-6 card border-amber-300 bg-amber-50/50">
+      <div className="flex items-center justify-between mb-3">
+        <h3 className="font-semibold text-sm">Edit contact info</h3>
+        <div className="flex gap-2">
+          <button type="button" onClick={cancel} disabled={saving} className="btn-ghost text-xs" data-testid="customer-edit-cancel">
+            <X size={12} /> Cancel
+          </button>
+          <button type="submit" disabled={saving} className="btn-primary text-xs" data-testid="customer-edit-save">
+            {saving ? <Loader2 size={12} className="animate-spin" /> : <Check size={12} />}
+            {saving ? 'Saving…' : 'Save'}
+          </button>
+        </div>
+      </div>
+      {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">{error}</div>}
+      <div className="grid grid-cols-2 gap-3">
+        <label className="text-xs">
+          <span className="text-slate-500">Name *</span>
+          <input className="input mt-1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required data-testid="customer-edit-name" />
+        </label>
+        <label className="text-xs">
+          <span className="text-slate-500">Company</span>
+          <input className="input mt-1" value={form.company} onChange={(e) => setForm({ ...form, company: e.target.value })} data-testid="customer-edit-company" />
+        </label>
+        <label className="text-xs">
+          <span className="text-slate-500">Email</span>
+          <input type="email" className="input mt-1" value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} data-testid="customer-edit-email" />
+        </label>
+        <label className="text-xs">
+          <span className="text-slate-500">Phone</span>
+          <input className="input mt-1" value={form.phone} onChange={(e) => setForm({ ...form, phone: e.target.value })} data-testid="customer-edit-phone" />
+        </label>
+      </div>
+      <label className="text-xs block mt-3">
+        <span className="text-slate-500">Notes</span>
+        <textarea className="input mt-1 min-h-[80px]" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} data-testid="customer-edit-notes" />
+      </label>
+    </form>
+  );
+}
 
 export default function CustomerDetail() {
   const { id } = useParams();
@@ -45,13 +167,9 @@ export default function CustomerDetail() {
   return (
     <div>
       <Link to="/customers" className="text-sm text-slate-500 hover:underline">← All customers</Link>
-      <div className="mt-2 mb-6">
-        <h2 className="text-2xl font-bold">{c.name}</h2>
-        <div className="text-sm text-slate-500">{c.company} · {c.email} · {c.phone}</div>
-        {c.notes && <p className="text-sm text-slate-700 mt-2">{c.notes}</p>}
-        <div className="mt-3 text-sm">
-          <span className="badge-slate mr-2">Total time: {formatDuration(c.total_time_seconds)}</span>
-        </div>
+      <EditableContact customer={c} onSaved={load} />
+      <div className="mt-3 text-sm">
+        <span className="badge-slate mr-2">Total time: {formatDuration(c.total_time_seconds)}</span>
       </div>
 
       <div className="flex gap-2 border-b border-slate-200 mb-4">

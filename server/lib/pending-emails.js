@@ -186,14 +186,24 @@ export function dismissPendingEmail(db, pendingId) {
   return { ok: true };
 }
 
-export function listPendingEmails(db, { status = 'pending', limit = 50 } = {}) {
-  return db.prepare(`
+export function listPendingEmails(db, { status = 'pending', limit = 50, offset = 0, since, until } = {}) {
+  // Optional date filtering: the list can be restricted to a window without
+  // re-running the scan. The scan window is the "what we asked Gmail for";
+  // this list window is "what we're looking at right now".
+  let sql = `
     SELECT id, message_id, uid, from_name, from_email, subject, snippet, received_at, status, imported_ticket_id, fetched_at, flagged
     FROM pending_emails
     WHERE status = ?
-    ORDER BY id DESC
-    LIMIT ?
-  `).all(status, limit);
+  `;
+  const args = [status];
+  if (since) { sql += ' AND received_at >= ?'; args.push(since); }
+  if (until) { sql += ' AND received_at <= ?'; args.push(until); }
+  // Newest email at the top. `received_at` is the email's actual send time;
+  // `id DESC` breaks ties when multiple rows share a second (common with
+  // batched IMAP fetches) so the ordering is fully deterministic.
+  sql += ' ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?';
+  args.push(limit, offset);
+  return db.prepare(sql).all(...args);
 }
 
 export { inboxConfig };

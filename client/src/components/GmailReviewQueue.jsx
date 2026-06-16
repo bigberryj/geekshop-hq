@@ -27,7 +27,19 @@ const RANGE_PRESETS = [
   { key: 'custom', label: 'Custom…', hours: null },
 ];
 
+// Display-filter presets: separate from scan range, controls what's
+// shown in the queue right now without re-fetching from Gmail.
+const FILTER_PRESETS = [
+  { key: 'all', label: 'All time', hours: null },
+  { key: '24h', label: 'Last 24h', hours: 24 },
+  { key: '7d',  label: 'Last 7d',  hours: 24 * 7 },
+  { key: '30d', label: 'Last 30d', hours: 24 * 30 },
+  { key: '90d', label: 'Last 90d', hours: 24 * 90 },
+  { key: 'custom', label: 'Custom…', hours: null },
+];
+
 const STORAGE_KEY = 'ghq.inbox.scanPrefs.v1';
+const FILTER_STORAGE_KEY = 'ghq.inbox.filterPrefs.v1';
 
 function loadPrefs() {
   try {
@@ -39,6 +51,20 @@ function loadPrefs() {
 
 function savePrefs(p) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(p)); } catch (e) { /* ignore */ }
+}
+
+function loadFilterPrefs() {
+  try {
+    const raw = localStorage.getItem(FILTER_STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch (e) { /* fall through */ }
+  // Default: show last 30 days, so the inbox is usable on first load
+  // (without it, all 556 pending emails dump into the list at once).
+  return { range: '30d', customSince: '', customUntil: '' };
+}
+
+function saveFilterPrefs(p) {
+  try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(p)); } catch (e) { /* ignore */ }
 }
 
 function isoForHoursAgo(hours) {
@@ -59,11 +85,35 @@ export default function GmailReviewQueue({ onImported }) {
   const [customUntil, setCustomUntil] = useState(initial.customUntil);
   const [includeStarred, setIncludeStarred] = useState(initial.includeStarred);
 
+  const initialFilter = loadFilterPrefs();
+  const [filterRange, setFilterRange] = useState(initialFilter.range);
+  const [filterCustomSince, setFilterCustomSince] = useState(initialFilter.customSince);
+  const [filterCustomUntil, setFilterCustomUntil] = useState(initialFilter.customUntil);
+
   useEffect(() => { savePrefs({ range, customSince, customUntil, includeStarred }); }, [range, customSince, customUntil, includeStarred]);
+  useEffect(() => { saveFilterPrefs({ range: filterRange, customSince: filterCustomSince, customUntil: filterCustomUntil }); }, [filterRange, filterCustomSince, filterCustomUntil]);
+
+  const buildFilterParams = useCallback(() => {
+    const params = new URLSearchParams();
+    params.set('status', 'pending');
+    if (filterRange === 'all') return params.toString();
+    let since, until;
+    if (filterRange === 'custom') {
+      if (filterCustomSince) since = new Date(filterCustomSince).toISOString();
+      if (filterCustomUntil) until = new Date(filterCustomUntil).toISOString();
+    } else {
+      const preset = FILTER_PRESETS.find((p) => p.key === filterRange);
+      if (preset && preset.hours) since = isoForHoursAgo(preset.hours);
+    }
+    if (since) params.set('since', since);
+    if (until) params.set('until', until);
+    return params.toString();
+  }, [filterRange, filterCustomSince, filterCustomUntil]);
 
   const load = useCallback(async () => {
     try {
-      const r = await fetchJson('/inbox/pending?status=pending');
+      const qs = buildFilterParams();
+      const r = await fetchJson(`/inbox/pending?${qs}`);
       const items = Array.isArray(r) ? r : (r.items || r.rows || []);
       setPending(items);
       setTotal(typeof r === 'object' && r.total != null ? r.total : items.length);
@@ -72,7 +122,7 @@ export default function GmailReviewQueue({ onImported }) {
       setPending([]);
       setTotal(0);
     }
-  }, []);
+  }, [buildFilterParams]);
 
   useEffect(() => { load(); }, [load]);
 
@@ -197,6 +247,32 @@ export default function GmailReviewQueue({ onImported }) {
       )}
 
       {error && <div className="rounded bg-red-50 border border-red-200 text-red-700 text-xs p-2 mb-2">{error}</div>}
+
+      <div className="flex flex-wrap items-center gap-2 mb-3 text-xs" data-testid="display-filter">
+        <span className="text-slate-500">Showing:</span>
+        <div className="inline-flex rounded border border-slate-200 overflow-hidden">
+          {FILTER_PRESETS.map((p) => (
+            <button
+              key={p.key}
+              onClick={() => setFilterRange(p.key)}
+              className={`px-2 py-1 ${filterRange === p.key ? 'bg-slate-200 text-slate-800 font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              data-testid={`filter-${p.key}`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {filterRange === 'custom' && (
+          <div className="flex items-center gap-2 ml-2">
+            <label className="text-slate-500">From</label>
+            <input type="datetime-local" value={filterCustomSince} onChange={(e) => setFilterCustomSince(e.target.value)}
+              className="px-2 py-1 border border-slate-200 rounded text-xs" data-testid="filter-custom-since" />
+            <label className="text-slate-500">To</label>
+            <input type="datetime-local" value={filterCustomUntil} onChange={(e) => setFilterCustomUntil(e.target.value)}
+              className="px-2 py-1 border border-slate-200 rounded text-xs" data-testid="filter-custom-until" />
+          </div>
+        )}
+      </div>
 
       {pending == null ? (
         <p className="text-sm text-slate-500">Loading…</p>

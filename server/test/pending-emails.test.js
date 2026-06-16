@@ -101,16 +101,35 @@ describe('pending_emails list shape (regression: 100-cap bug)', () => {
     }
   });
 
-  it('orders by id DESC (newest first), not fetched_at', () => {
-    // The prior code ordered by `fetched_at DESC`, which for messages
-    // bulk-fetched in the same call is non-deterministic. After the
-    // imapflow-uid-bug scan, all 218 messages share an identical fetched_at,
-    // so the order is fully driven by id.
+  it('orders by received_at DESC, id DESC (newest email first)', () => {
+    // received_at is the email's actual send time. id DESC is a tiebreaker
+    // for the common case where multiple rows share a second.
     const list = listPendingEmails(db2, { status: 'pending', limit: 100 });
     expect(list.length).toBe(100);
     for (let i = 1; i < list.length; i++) {
-      expect(list[i - 1].id).toBeGreaterThanOrEqual(list[i].id);
+      const prev = new Date(list[i - 1].received_at).getTime();
+      const cur = new Date(list[i].received_at).getTime();
+      // Primary: received_at non-increasing
+      expect(prev).toBeGreaterThanOrEqual(cur);
+      // Tiebreaker: id non-increasing when received_at is equal
+      if (prev === cur) expect(list[i - 1].id).toBeGreaterThanOrEqual(list[i].id);
     }
+  });
+
+  it('orders mixed received_at correctly (newest email, not newest insert, wins)', () => {
+    // Regression: prior code ordered by id, so an old email that arrived
+    // just now (and got a high id) would sit on top of a newer email that
+    // was scanned earlier (and got a lower id). received_at fixes that.
+    const fresh = listPendingEmails(db2, { status: 'pending', limit: 500 });
+    const oldId = fresh[fresh.length - 1].id; // lowest id
+    const newId = fresh[0].id; // highest id
+    // Bump the OLDEST message to a future date — it should now appear first.
+    db2.prepare('UPDATE pending_emails SET received_at = ? WHERE id = ?')
+      .run('2027-01-01T00:00:00Z', oldId);
+    const reordered = listPendingEmails(db2, { status: 'pending', limit: 5 });
+    expect(reordered[0].id).toBe(oldId); // the date-bumped one is now on top
+    // And the newId is no longer first
+    expect(reordered[0].id).not.toBe(newId);
   });
 
   it('supports a high limit to fetch the whole queue (cap was 100)', () => {

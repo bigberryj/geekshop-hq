@@ -7,8 +7,10 @@ export default function TicketDetail() {
   const { id } = useParams();
   const [ticket, setTicket] = useState(null);
   const [draft, setDraft] = useState('');
+  const [originalDraft, setOriginalDraft] = useState(''); // for feedback diff
   const [reply, setReply] = useState('');
   const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
 
   const load = () => fetchJson(`/tickets/${id}`).then(setTicket);
   useEffect(() => { load(); }, [id]);
@@ -17,10 +19,26 @@ export default function TicketDetail() {
 
   const generateDraft = async () => {
     setBusy(true);
+    setError(null);
     try {
-      const { draft } = await postJson(`/tickets/${id}/ai-draft`, {});
-      setDraft(draft);
+      const r = await postJson(`/tickets/${id}/ai-draft`, {});
+      setDraft(r.draft);
+      setOriginalDraft(r.draft); // snapshot for feedback comparison
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
     } finally { setBusy(false); }
+  };
+
+  // Fire-and-forget style feedback. If Byron edited the draft before sending,
+  // POST the (original, final) pair so the AI learns from the change.
+  const maybeCaptureFeedback = (finalText) => {
+    if (!originalDraft || !finalText) return;
+    if (originalDraft === finalText) return;
+    if (originalDraft.length < 10 || finalText.length < 5) return; // skip trivial
+    postJson(`/tickets/${id}/ai-draft/feedback`, {
+      draft_text: originalDraft,
+      final_text: finalText,
+    }).catch(() => { /* non-blocking */ });
   };
 
   const sendReply = async (useDraft) => {
@@ -29,8 +47,11 @@ export default function TicketDetail() {
     setBusy(true);
     try {
       await postJson(`/tickets/${id}/messages`, { body, ai_draft: useDraft ? 1 : 0 });
-      setReply(''); setDraft('');
+      if (useDraft) maybeCaptureFeedback(body);
+      setReply(''); setDraft(''); setOriginalDraft('');
       load();
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
     } finally { setBusy(false); }
   };
 
@@ -42,9 +63,12 @@ export default function TicketDetail() {
     try {
       const result = await postJson(`/tickets/${id}/email-reply`, { body });
       if (result.sent) {
-        setReply(''); setDraft('');
+        if (useDraft) maybeCaptureFeedback(body);
+        setReply(''); setDraft(''); setOriginalDraft('');
         load();
       }
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
     } finally { setBusy(false); }
   };
 
@@ -56,9 +80,12 @@ export default function TicketDetail() {
     try {
       const result = await postJson(`/tickets/${id}/resolve-with-reply`, { reply_body: body });
       if (result.ok) {
-        setReply(''); setDraft('');
+        if (useDraft) maybeCaptureFeedback(body);
+        setReply(''); setDraft(''); setOriginalDraft('');
         load();
       }
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
     } finally { setBusy(false); }
   };
 
@@ -158,8 +185,20 @@ export default function TicketDetail() {
         </div>
         {draft && (
           <div className="mb-3 p-3 bg-amber-50 border border-amber-200 rounded">
-            <div className="text-xs text-slate-500 mb-1">AI draft (click to use)</div>
-            <div className="text-sm whitespace-pre-wrap">{draft}</div>
+            <div className="flex items-center justify-between mb-1">
+              <div className="text-xs text-slate-500">
+                AI draft — edit below before sending. Your edits help the AI learn your voice.
+              </div>
+              {draft !== originalDraft && (
+                <span className="text-xs text-amber-700 font-medium" data-testid="draft-edited">edited</span>
+              )}
+            </div>
+            <textarea
+              className="input min-h-[100px] bg-white"
+              value={draft}
+              onChange={(e) => setDraft(e.target.value)}
+              data-testid="ai-draft-textarea"
+            />
             <div className="mt-2 flex gap-2">
               <button className="btn-secondary" onClick={() => sendReply(true)} disabled={busy}>
                 Save to convo

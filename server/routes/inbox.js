@@ -64,20 +64,42 @@ export async function inboxRoutes(app) {
     }
   });
 
-  app.get('/api/inbox/pending', async (req) => {
+  app.get('/api/inbox/pending', async (req, reply) => {
     const status = (req.query.status || 'pending').toString();
     const limit = Math.min(Math.max(Number(req.query.limit) || 250, 1), 500);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
-    // Wrap the array in an object so we can include pagination metadata.
-    // Backward compat: existing UI reads `result.length` and `result.map(...)`,
-    // so we put the array as the `items` field, not the top-level value.
-    // If the UI is updated to consume `items`, we can drop the alias `rows`.
-    const items = listPendingEmails(app.db, { status, limit, offset });
+    // Optional date window — ISO date strings, applied to received_at.
+    // Bad date strings return 400 rather than silently ignoring the filter.
+    const parseDate = (v) => {
+      if (v == null || v === '') return null;
+      const d = new Date(v);
+      if (isNaN(d.getTime())) throw new Error(`invalid date: ${v}`);
+      return d.toISOString();
+    };
+    let since, until;
+    try {
+      since = parseDate(req.query.since);
+      until = parseDate(req.query.until);
+    } catch (e) {
+      return reply.code(400).send({ error: e.message });
+    }
+    if (since && until && new Date(since).getTime() > new Date(until).getTime()) {
+      return reply.code(400).send({ error: 'since must be before until' });
+    }
+    const items = listPendingEmails(app.db, { status, limit, offset, since, until });
+    // `total` is the count under the same filter so the UI can show
+    // "X of Y" correctly when the user has narrowed the date window.
+    const countSql = `SELECT COUNT(*) as n FROM pending_emails WHERE status = ?${since ? ' AND received_at >= ?' : ''}${until ? ' AND received_at <= ?' : ''}`;
+    const countArgs = [status];
+    if (since) countArgs.push(since);
+    if (until) countArgs.push(until);
+    const total = app.db.prepare(countSql).get(...countArgs).n;
     return {
       items,
       rows: items, // alias for any client that still expects a flat array
-      total: app.db.prepare('SELECT COUNT(*) as n FROM pending_emails WHERE status = ?').get(status).n,
+      total,
       limit, offset,
+      filter: { since, until },
     };
   });
 

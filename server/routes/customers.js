@@ -62,4 +62,45 @@ export async function customerRoutes(app) {
     const invoices = app.db.prepare('SELECT id, invoice_uid, status, total_cents, sent_at, due_at, paid_at FROM invoices WHERE customer_id = ? ORDER BY created_at DESC').all(req.params.id);
     return { ...c, tickets, memory, total_time_seconds: time_total.total_seconds, invoices };
   });
+
+  // Update — partial-update endpoint. Whitelists columns so a caller can't
+  // overwrite `id`, `created_at`, or any other protected field. Empty
+  // string → NULL for nullable fields so the UI can clear values.
+  const UPDATABLE = ['name', 'company', 'email', 'phone', 'notes'];
+  const updateHandler = async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
+    const existing = app.db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
+    if (!existing) return reply.code(404).send({ error: 'not found' });
+    const body = req.body || {};
+    // Name is NOT NULL; reject clearing it.
+    if (Object.prototype.hasOwnProperty.call(body, 'name') && !String(body.name).trim()) {
+      return reply.code(400).send({ error: 'name cannot be empty' });
+    }
+    const updates = [];
+    const params = [];
+    for (const k of UPDATABLE) {
+      if (Object.prototype.hasOwnProperty.call(body, k)) {
+        const v = body[k];
+        updates.push(`${k} = ?`);
+        params.push(v === '' ? null : v);
+      }
+    }
+    if (updates.length === 0) return reply.code(400).send({ error: 'no fields to update' });
+    params.push(id);
+    app.db.prepare(`UPDATE customers SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    // Audit log payload uses the SAME keys that were actually updated.
+    // Map the SQL fragments ("name = ?") back to the field name ("name")
+    // so the audit row tells you which fields changed and to what value.
+    const changedFields = {};
+    for (const frag of updates) {
+      const key = frag.split(' = ')[0].trim();
+      changedFields[key] = body[key];
+    }
+    app.db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'customer.update', ?, ?)")
+      .run(String(id), JSON.stringify(changedFields));
+    return app.db.prepare('SELECT * FROM customers WHERE id = ?').get(id);
+  };
+  app.put('/api/customers/:id', updateHandler);
+  app.patch('/api/customers/:id', updateHandler);
 }

@@ -36,75 +36,91 @@ try {
       const m = line.match(/^([A-Z_][A-Z0-9_]*)=(.*)$/);
       if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
     }
-    console.log('[boot] loaded server/.env');
   }
 } catch { /* ignore */ }
 
-const HOST = process.env.HOST || '0.0.0.0';
-const PORT = Number(process.env.PORT || 5050);
-const NODE_ENV = process.env.NODE_ENV || 'development';
-
-const app = Fastify({
-  logger: {
-    level: NODE_ENV === 'production' ? 'info' : 'debug',
-    transport: NODE_ENV === 'production' ? undefined : { target: 'pino-pretty' },
-  },
-  trustProxy: true,
-});
-
-// --- Plugins ---
-await app.register(helmet, { contentSecurityPolicy: false });
-await app.register(cors, {
-  origin: process.env.APP_URL ? [process.env.APP_URL, 'http://localhost:5173'] : true,
-  credentials: true,
-});
-
-// --- DB ---
-const db = await runMigrations(resolve(rootDir, 'data/hq.db'));
-app.decorate('db', db);
-
-// --- SMTP health (don't block boot) ---
-verifySmtp().then((ok) => {
-  if (ok) app.log.info('SMTP verified');
-  else app.log.warn('SMTP not configured (emails will queue as nudges)');
-});
-
-// --- Routes ---
-await registerRoutes(app, { rootDir });
-
-// --- Gmail inbox poller: queues new messages into pending_emails for admin review ---
-if (inboxConfig.hasCreds) {
-  startPoller({
-    intervalMin: inboxConfig.pollIntervalMin,
-    onNewMessage: async (msg) => {
-      app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message queued for review');
-      try {
-        const result = await scanPendingEmails(app.db, { limit: 1 });
-        app.log.info({ inserted: result.inserted, skipped: result.skipped_existing }, 'inbox: queued');
-      } catch (e) {
-        app.log.warn({ err: e.message }, 'inbox: queue failed');
-      }
-    },
+/**
+ * Build a Fastify app with all routes, DB, plugins wired up.
+ * Options:
+ *   - dbPath: override the SQLite path (used by tests to use :memory: or tmp)
+ *   - logger: false to silence logs (tests do this)
+ *   - skipScheduler: don't start background jobs (tests)
+ *   - skipPoller: don't start the Gmail poller (tests, no creds anyway)
+ */
+export async function buildServer(opts = {}) {
+  const dbPath = opts.dbPath || resolve(rootDir, 'data/hq.db');
+  const app = Fastify({
+    logger: opts.logger ?? { level: process.env.NODE_ENV === 'production' ? 'info' : 'warn' },
+    trustProxy: true,
   });
-  app.log.info({ intervalMin: inboxConfig.pollIntervalMin, mode: 'pending_queue' }, 'Gmail poller started');
+
+  await app.register(helmet, { contentSecurityPolicy: false });
+  await app.register(cors, {
+    origin: process.env.APP_URL ? [process.env.APP_URL, 'http://localhost:5173'] : true,
+    credentials: true,
+  });
+
+  const db = await runMigrations(dbPath);
+  app.decorate('db', db);
+
+  await registerRoutes(app, { rootDir });
+
+  // Best-effort SMTP verify; never block boot
+  if (!opts.skipSmtp) {
+    verifySmtp().then((ok) => {
+      if (ok) app.log.info('SMTP verified');
+      else app.log.warn('SMTP not configured (emails will queue as nudges)');
+    });
+  }
+
+  // Optional: Gmail poller. Off by default in tests (no creds or skipPoller).
+  if (!opts.skipPoller && inboxConfig.hasCreds) {
+    startPoller({
+      intervalMin: inboxConfig.pollIntervalMin,
+      onNewMessage: async (msg) => {
+        app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message queued for review');
+        try {
+          const result = await scanPendingEmails(app.db, { limit: 1 });
+          app.log.info({ inserted: result.inserted, skipped: result.skipped_existing }, 'inbox: queued');
+        } catch (e) {
+          app.log.warn({ err: e.message }, 'inbox: queue failed');
+        }
+      },
+    });
+    app.log.info({ intervalMin: inboxConfig.pollIntervalMin, mode: 'pending_queue' }, 'Gmail poller started');
+  }
+
+  return app;
 }
 
-// --- Graceful shutdown ---
-const shutdown = async (signal) => {
-  app.log.info({ signal }, 'shutting down');
-  stopScheduler();
-  await app.close();
-  process.exit(0);
-};
-process.on('SIGINT', () => shutdown('SIGINT'));
-process.on('SIGTERM', () => shutdown('SIGTERM'));
+// --- Main (run directly): build + listen + start scheduler ---
+const HOST = process.env.HOST || '0.0.0.0';
+const PORT = Number(process.env.PORT || 5050);
 
-// --- Listen ---
-try {
-  await app.listen({ host: HOST, port: PORT });
-  startScheduler(app);
-  app.log.info(`GeekShop HQ backend listening on http://${HOST}:${PORT}`);
-} catch (err) {
-  app.log.error(err);
-  process.exit(1);
+async function main() {
+  const app = await buildServer();
+  try {
+    await app.listen({ host: HOST, port: PORT });
+    startScheduler(app);
+    app.log.info(`GeekShop HQ backend listening on http://${HOST}:${PORT}`);
+  } catch (err) {
+    app.log.error(err);
+    process.exit(1);
+  }
+
+  const shutdown = async (signal) => {
+    app.log.info({ signal }, 'shutting down');
+    stopScheduler();
+    await app.close();
+    process.exit(0);
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
+// Run main() only when this file is the entrypoint. When imported (e.g. by
+// tests), the export `buildServer` is used and main() is skipped.
+const isEntrypoint = import.meta.url === `file://${process.argv[1]}`;
+if (isEntrypoint) {
+  main();
 }

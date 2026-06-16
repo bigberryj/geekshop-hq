@@ -3,6 +3,7 @@
  */
 
 import { aiCall } from '../lib/ai.js';
+import { buildStyleProfile, recordStyleFeedback } from '../lib/style.js';
 import { sendEmail } from '../lib/email.js';
 import { markThreadDone } from '../lib/email-inbox.js';
 
@@ -105,11 +106,49 @@ ${convo || '(no messages yet)'}
 
 Reply with just the draft text, no preamble.`;
 
-    const result = await aiCall('high_reasoning', prompt, {
-      system: 'You write warm, specific, professional support replies. Reference the customer\'s known equipment/preferences. No upsell. No "I hope this email finds you well."',
-      maxTokens: 400,
+    // Build Byron's voice profile (style rules + sample lines) and prepend
+    // to the system prompt. Falls back to a generic prompt if we don't
+    // have enough samples yet.
+    const profile = await buildStyleProfile(app.db);
+    const system = profile.ok
+      ? 'You are Byron\'s AI reply assistant. Drafts are sent under Byron\'s name to real customers.\n' +
+        'Be warm, direct, specific. Reference known equipment/preferences. No upsell. ' +
+        'No "I hope this email finds you well."\n' + profile.prompt
+      : 'You are Byron\'s AI reply assistant. Drafts are sent under Byron\'s name. ' +
+        'Be warm, direct, specific. Reference known equipment/preferences. No upsell. ' +
+        'No "I hope this email finds you well."';
+
+    const result = await aiCall('high_reasoning', prompt, { system, maxTokens: 400 });
+    return { draft: result.output, provider: result.provider, styleSamples: profile.sampleCount };
+  });
+
+  // Inspect the current style profile (so admins can see what the AI
+  // is learning about their voice). Useful for debugging "why does the
+  // draft sound formal?".
+  app.get('/api/style/profile', async () => {
+    const profile = await buildStyleProfile(app.db);
+    const counts = app.db.prepare(`
+      SELECT source, COUNT(*) as n FROM style_samples GROUP BY source
+    `).all();
+    return { ...profile, samplesBySource: counts };
+  });
+
+  // Capture a style feedback: Byron edited an AI draft before sending.
+  // Used to refine the style profile over time.
+  app.post('/api/tickets/:id/ai-draft/feedback', async (req, reply) => {
+    const { draft_text, final_text } = req.body || {};
+    if (!draft_text || !final_text) {
+      return reply.code(400).send({ error: 'draft_text and final_text required' });
+    }
+    if (draft_text === final_text) {
+      return reply.code(400).send({ error: 'draft and final are identical — no edit to learn from' });
+    }
+    const id = recordStyleFeedback(app.db, {
+      ticketId: Number(req.params.id),
+      draftText: draft_text,
+      finalText: final_text,
     });
-    return { draft: result.output, provider: result.provider };
+    return { ok: true, feedback_id: id };
   });
 
   // AI summary
