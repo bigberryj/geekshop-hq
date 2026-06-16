@@ -1,54 +1,45 @@
 import { useEffect, useState } from 'react';
 import { fetchJson, formatMoney, postJson } from '../lib/api.js';
+import InvoiceDraftModal from '../components/InvoiceDraftModal.jsx';
 
 export default function Money() {
   const [summary, setSummary] = useState(null);
   const [invoices, setInvoices] = useState([]);
   const [timeRevenue, setTimeRevenue] = useState(null);
   const [customers, setCustomers] = useState([]);
+  const [settings, setSettings] = useState({});
   const [busy, setBusy] = useState(false);
   const [draftError, setDraftError] = useState('');
+  const [draftFor, setDraftFor] = useState(null); // customer object when modal is open
 
   const load = async () => {
-    const [s, inv, tr, cust] = await Promise.all([
+    const [s, inv, tr, cust, set] = await Promise.all([
       fetchJson('/money/summary'),
       fetchJson('/invoices'),
       fetchJson('/money/time-revenue'),
       fetchJson('/customers'),
+      fetchJson('/settings'),
     ]);
     setSummary(s);
     setInvoices(inv);
     setTimeRevenue(tr);
     setCustomers(cust);
+    setSettings(set);
   };
   useEffect(() => { load(); }, []);
 
+  const onCreated = (invoice) => {
+    load();
+    setDraftFor(null);
+  };
+
   const draftFromTime = async (customerId) => {
-    setBusy(true);
-    setDraftError('');
-    try {
-      const draft = await postJson('/invoices/draft-from-time', { customer_id: customerId });
-      // Auto-create the invoice
-      const created = await postJson('/invoices', {
-        customer_id: customerId,
-        line_items: draft.line_items,
-        tax_model: draft.tax_model_key,
-      });
-      // Mark the time entries as invoiced so they don't show again
-      const timeEntryIds = draft.line_items
-        .map((li) => li.source_time_entry_id)
-        .filter(Boolean);
-      if (timeEntryIds.length) {
-        await postJson('/time-entries/mark-invoiced', { time_entry_ids: timeEntryIds });
-      }
-      load();
-      // Open the new invoice's print view in a new tab
-      window.open(`/api/invoices/${created.id}/print`, '_blank');
-    } catch (e) {
-      setDraftError(e.response?.data?.error || e.message);
-    } finally {
-      setBusy(false);
-    }
+    // New flow: open the draft modal. The modal calls the draft endpoint,
+    // lets you toggle/override the minimum charge, and creates the invoice
+    // on confirm. The old auto-create flow is gone — you wanted to see the
+    // math (especially the floor) before committing.
+    const cust = customers.find((c) => c.id === customerId);
+    if (cust) setDraftFor(cust);
   };
 
   if (!summary) return <div>Loading…</div>;
@@ -77,7 +68,11 @@ export default function Money() {
         </section>
         <section className="card">
           <h3 className="font-semibold mb-2">Draft invoice from time</h3>
-          <p className="text-xs text-slate-500 mb-2">Pulls a customer's un-invoiced time entries, multiplies by your labour rate, applies the default tax model, and opens the printable invoice.</p>
+          <p className="text-xs text-slate-500 mb-2">
+            Pulls a customer's un-invoiced time entries, multiplies by your labour rate, optionally applies
+            your private minimum charge, and shows a preview before creating. The minimum charge is silently
+            folded into the labour lines — the customer never sees a "minimum" line on the invoice.
+          </p>
           {draftError && <div className="text-xs text-red-600 mb-2">{draftError}</div>}
           <div className="flex flex-wrap gap-2">
             {customers.map((c) => (
@@ -151,6 +146,15 @@ export default function Money() {
           </table>
         )}
       </div>
+
+      {draftFor && (
+        <InvoiceDraftModal
+          customer={draftFor}
+          onClose={() => setDraftFor(null)}
+          onCreated={onCreated}
+          configuredFloorCents={Number(settings.minimum_charge_cents) || 0}
+        />
+      )}
     </div>
   );
 }

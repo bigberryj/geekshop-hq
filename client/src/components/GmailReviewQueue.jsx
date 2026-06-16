@@ -1,6 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
 import { fetchJson, postJson } from '../lib/api.js';
-import { Mail, RefreshCw, Inbox as InboxIcon, Loader2, Star } from 'lucide-react';
+import { Mail, RefreshCw, Inbox as InboxIcon, Loader2, Star, X, RotateCcw } from 'lucide-react';
+import ContactEnrichmentModal from './ContactEnrichmentModal.jsx';
 
 /**
  * GmailReviewQueue
@@ -78,6 +79,18 @@ export default function GmailReviewQueue({ onImported }) {
   const [busyId, setBusyId] = useState(null);
   const [error, setError] = useState('');
   const [scanResult, setScanResult] = useState(null);
+  // Enrichment modal: shown when the server's import returns a Google
+  // Contacts match for the sender. Server does the lookup, client just
+  // asks the admin which fields to apply.
+  const [enrichmentMatch, setEnrichmentMatch] = useState(null);
+  // Bulk-dismiss: Set of selected pending row ids. Bulk-dismiss button
+  // acts on all of them in one POST.
+  const [selectedIds, setSelectedIds] = useState(new Set());
+  const [bulkBusy, setBulkBusy] = useState(false);
+  // Show dismissed rows? When on, the GET /api/inbox/pending returns
+  // both pending and dismissed rows; the list shows both with a status
+  // badge and a Restore button on dismissed ones.
+  const [showDismissed, setShowDismissed] = useState(false);
 
   const initial = loadPrefs();
   const [range, setRange] = useState(initial.range);
@@ -95,7 +108,14 @@ export default function GmailReviewQueue({ onImported }) {
 
   const buildFilterParams = useCallback(() => {
     const params = new URLSearchParams();
-    params.set('status', 'pending');
+    if (showDismissed) {
+      // When showing dismissed, omit the status param and use the
+      // include_dismissed flag — the server returns BOTH pending and
+      // dismissed rows in one query.
+      params.set('include_dismissed', 'true');
+    } else {
+      params.set('status', 'pending');
+    }
     if (filterRange === 'all') return params.toString();
     let since, until;
     if (filterRange === 'custom') {
@@ -108,7 +128,7 @@ export default function GmailReviewQueue({ onImported }) {
     if (since) params.set('since', since);
     if (until) params.set('until', until);
     return params.toString();
-  }, [filterRange, filterCustomSince, filterCustomUntil]);
+  }, [filterRange, filterCustomSince, filterCustomUntil, showDismissed]);
 
   const load = useCallback(async () => {
     try {
@@ -162,8 +182,16 @@ export default function GmailReviewQueue({ onImported }) {
     setError('');
     try {
       const r = await postJson(`/inbox/pending/${id}/import`, {});
-      if (r.error) setError(r.error);
-      else {
+      if (r.error) {
+        setError(r.error);
+      } else {
+        // If the server found a Google Contacts match, pop the enrichment
+        // modal so the admin can pre-fill blank customer fields. Pass
+        // along the customer so the modal knows the target id.
+        if (r.contactMatch && r.contactMatch.ok && r.contactMatch.diff) {
+          // Build a combined match object with the customer reference
+          setEnrichmentMatch({ ...r.contactMatch, customer: r.customer, pendingId: id });
+        }
         await load();
         onImported?.(r);
       }
@@ -188,6 +216,61 @@ export default function GmailReviewQueue({ onImported }) {
     }
   };
 
+  // Bulk-dismiss: send a single POST with the list of selected ids.
+  // Server returns counts; we show a brief confirmation.
+  const bulkDismiss = async () => {
+    if (selectedIds.size === 0) return;
+    setBulkBusy(true);
+    setError('');
+    try {
+      const r = await postJson('/inbox/pending/bulk-dismiss', { ids: Array.from(selectedIds) });
+      if (r.error) {
+        setError(r.error);
+      } else {
+        setSelectedIds(new Set());
+        await load();
+        // Show scan result banner with the bulk-dismiss outcome.
+        setScanResult({ window: { since: null, until: null, includeStarred: true, limit: 0 }, fetched: 0, inserted: 0, auto_dismissed: 0, skipped_existing: 0, bulk_dismissed: r.dismissed, bulk_skipped: r.skipped, errors: [] });
+      }
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setBulkBusy(false);
+    }
+  };
+
+  // Restore: moves a dismissed row back to pending. Used by the Restore
+  // button on dismissed rows in "Show dismissed" mode.
+  const restore = async (id) => {
+    setBusyId(id);
+    setError('');
+    try {
+      const r = await postJson(`/inbox/pending/${id}/restore`, {});
+      if (r.error) setError(r.error);
+      else await load();
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const toggleSelect = (id) => setSelectedIds((s) => {
+    const next = new Set(s);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const toggleSelectAll = () => {
+    if (!pending) return;
+    const pendingOnly = pending.filter((p) => p.status === 'pending');
+    const allSelected = pendingOnly.every((p) => selectedIds.has(p.id));
+    if (allSelected && pendingOnly.length > 0) {
+      setSelectedIds(new Set());
+    } else {
+      setSelectedIds(new Set(pendingOnly.map((p) => p.id)));
+    }
+  };
+
   return (
     <section className="card md:col-span-2 border-l-4 border-amber-400">
       <div className="flex items-center justify-between gap-3 mb-3">
@@ -195,10 +278,33 @@ export default function GmailReviewQueue({ onImported }) {
           <Mail size={16} /> Gmail review queue
           {pending && <span className="text-xs text-slate-500 font-normal">({pending.length}{total > pending.length ? ` of ${total}` : ''} pending)</span>}
         </h3>
-        <button className="btn-secondary text-xs flex items-center gap-1" onClick={scan} disabled={scanning}>
-          {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-          {scanning ? 'Scanning…' : 'Scan Gmail now'}
-        </button>
+        <div className="flex items-center gap-2">
+          {/* "Show dismissed" toggle — when on, both pending and dismissed
+              rows are shown, with a status badge and Restore button. */}
+          <label className="flex items-center gap-1 text-xs cursor-pointer" data-testid="show-dismissed-toggle">
+            <input
+              type="checkbox"
+              checked={showDismissed}
+              onChange={(e) => setShowDismissed(e.target.checked)}
+            />
+            <span className="text-slate-600">Show dismissed</span>
+          </label>
+          {selectedIds.size > 0 && (
+            <button
+              className="btn-secondary text-xs flex items-center gap-1"
+              onClick={bulkDismiss}
+              disabled={bulkBusy}
+              data-testid="bulk-dismiss-btn"
+            >
+              {bulkBusy ? <Loader2 size={12} className="animate-spin" /> : <X size={12} />}
+              {bulkBusy ? 'Dismissing…' : `Dismiss ${selectedIds.size} selected`}
+            </button>
+          )}
+          <button className="btn-secondary text-xs flex items-center gap-1" onClick={scan} disabled={scanning}>
+            {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {scanning ? 'Scanning…' : 'Scan Gmail now'}
+          </button>
+        </div>
       </div>
 
       <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
@@ -283,26 +389,57 @@ export default function GmailReviewQueue({ onImported }) {
       ) : (
         <ul className="space-y-2">
           {pending.map((p) => (
-            <li key={p.id} className="border border-slate-200 rounded p-3 bg-white">
+            <li key={p.id} className={`border rounded p-3 ${p.status === 'dismissed' ? 'border-slate-200 bg-slate-50 opacity-80' : 'border-slate-200 bg-white'}`}>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
-                  <div className="font-medium truncate">
-                    {p.subject || '(no subject)'}
-                    {p.flagged && <Star size={11} className="inline ml-1 text-amber-500 fill-amber-500" />}
+                  <div className="font-medium truncate flex items-center gap-2">
+                    {p.status === 'pending' && (
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(p.id)}
+                        onChange={() => toggleSelect(p.id)}
+                        className="shrink-0"
+                        data-testid={`row-select-${p.id}`}
+                        aria-label={`Select email from ${p.from_email || p.from_name || 'unknown'}`}
+                      />
+                    )}
+                    <span className="truncate">
+                      {p.subject || '(no subject)'}
+                      {p.flagged && <Star size={11} className="inline ml-1 text-amber-500 fill-amber-500" />}
+                    </span>
+                    {p.status === 'dismissed' && (
+                      <span className="text-xs px-1.5 py-0.5 bg-slate-200 text-slate-700 rounded shrink-0" data-testid={`status-badge-${p.id}`}>
+                        dismissed{p.dismissed_by === 'auto_junk' || p.dismissed_by === 'auto_ai' ? ' (auto)' : ''}
+                      </span>
+                    )}
                   </div>
                   <div className="text-xs text-slate-500 mt-0.5">
                     From <span className="font-mono">{p.from_email || p.from_name || 'unknown'}</span>
                     {p.received_at && <> · {new Date(p.received_at).toLocaleString()}</>}
                   </div>
                   {p.snippet && <div className="text-sm text-slate-600 mt-1 line-clamp-2">{p.snippet}</div>}
+                  {p.dismissed_reason && (
+                    <div className="text-xs text-slate-500 mt-1 italic" title="auto-dismiss reason">
+                      🤖 {p.dismissed_reason}
+                    </div>
+                  )}
                 </div>
                 <div className="flex gap-2 shrink-0">
-                  <button className="btn-primary text-xs" onClick={() => importOne(p.id)} disabled={busyId === p.id}>
-                    Import
-                  </button>
-                  <button className="btn-ghost text-xs" onClick={() => dismiss(p.id)} disabled={busyId === p.id}>
-                    Dismiss
-                  </button>
+                  {p.status === 'pending' && (
+                    <>
+                      <button className="btn-primary text-xs" onClick={() => importOne(p.id)} disabled={busyId === p.id}>
+                        Import
+                      </button>
+                      <button className="btn-ghost text-xs" onClick={() => dismiss(p.id)} disabled={busyId === p.id}>
+                        Dismiss
+                      </button>
+                    </>
+                  )}
+                  {p.status === 'dismissed' && (
+                    <button className="btn-secondary text-xs" onClick={() => restore(p.id)} disabled={busyId === p.id} data-testid={`restore-btn-${p.id}`}>
+                      <RotateCcw size={11} /> Restore
+                    </button>
+                  )}
                 </div>
               </div>
             </li>
@@ -314,6 +451,15 @@ export default function GmailReviewQueue({ onImported }) {
         Customers are auto-created at import time when missing — but only after you click <strong>Import</strong>.
         Nothing in the system changes without your say-so.
       </p>
+
+      {enrichmentMatch && (
+        <ContactEnrichmentModal
+          match={enrichmentMatch}
+          onApply={() => setEnrichmentMatch(null)}
+          onSkip={() => setEnrichmentMatch(null)}
+          onClose={() => setEnrichmentMatch(null)}
+        />
+      )}
     </section>
   );
 }

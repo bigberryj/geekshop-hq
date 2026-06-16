@@ -40,6 +40,17 @@ export default function Settings() {
     if (Number.isFinite(cents) && cents >= 0) update('labour_rate_cents_per_hour', String(cents));
   };
 
+  // Same pattern for the minimum charge. 0 = off.
+  const [minDraft, setMinDraft] = useState('');
+  useEffect(() => {
+    const v = Number(settings.minimum_charge_cents);
+    setMinDraft(Number.isFinite(v) ? (v / 100).toFixed(2) : '0.00');
+  }, [settings.minimum_charge_cents]);
+  const commitMin = () => {
+    const cents = Math.round(Number(minDraft) * 100);
+    if (Number.isFinite(cents) && cents >= 0) update('minimum_charge_cents', String(cents));
+  };
+
   return (
     <div>
       <h2 className="text-2xl font-bold mb-6">Settings</h2>
@@ -79,6 +90,29 @@ export default function Settings() {
             <span className="self-center text-xs text-slate-500">/hr</span>
           </div>
           <p className="text-xs text-slate-500 mt-1">Used when "draft from time entries" is clicked on the Money page. Stored as {settings.labour_rate_cents_per_hour || '10000'} cents/hr.</p>
+        </div>
+        <div className="mb-2 max-w-xs">
+          <label className="label">
+            Minimum charge floor ($ CAD) <span className="text-xs text-slate-500">— private, never shown to customers</span>
+          </label>
+          <div className="flex gap-2">
+            <input
+              className="input"
+              type="number"
+              step="0.01"
+              min="0"
+              value={minDraft}
+              onChange={(e) => setMinDraft(e.target.value)}
+              onBlur={commitMin}
+              onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
+            />
+            <span className="self-center text-xs text-slate-500">per invoice</span>
+          </div>
+          <p className="text-xs text-slate-500 mt-1">
+            When a draft from time entries is below this amount, the labour lines are silently re-priced up to the floor.
+            The customer sees a clean invoice with normal line items. Set to $0.00 to disable.
+            Currently {settings.minimum_charge_cents ? `${settings.minimum_charge_cents} cents` : 'disabled'}.
+          </p>
         </div>
       </section>
 

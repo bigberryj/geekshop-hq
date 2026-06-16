@@ -10,6 +10,8 @@
  */
 
 import { fetchUnread, fetchByMessageId, inboxConfig } from './email-inbox.js';
+import { findContactMatch } from './google-contacts.js';
+import { classifyEmail } from './junk-classifier.js';
 
 function findOrCreateCustomer(db, { email, name }) {
   if (email) {
@@ -45,6 +47,9 @@ export async function scanPendingEmails(db, {
   until,
   includeStarred = true,
   limit = 25,
+  // Default ON: auto-dismiss obvious junk during scan. Set false to
+  // disable (e.g. for batch reprocessing or testing).
+  autoDismissJunk = true,
 } = {}) {
   if (!(since instanceof Date)) since = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const cappedLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
@@ -52,10 +57,18 @@ export async function scanPendingEmails(db, {
   const result = {
     fetched: messages.length,
     inserted: 0,
+    auto_dismissed: 0,
     skipped_existing: 0,
     errors: [],
     window: { since: since.toISOString(), until: until ? until.toISOString() : null, includeStarred, limit: cappedLimit },
   };
+
+  // Pre-load the set of customer emails so the classifier can keep
+  // existing-customer emails out of the auto-dismiss bucket.
+  const customerEmails = new Set(
+    db.prepare("SELECT email FROM customers WHERE email IS NOT NULL AND email != ''").all().map((r) => r.email.toLowerCase())
+  );
+
   for (const m of messages) {
     try {
       // Match by message-id header first, then fall back to UID.
@@ -105,9 +118,26 @@ export async function scanPendingEmails(db, {
         result.skipped_existing += 1;
         continue;
       }
+      // Classify before inserting. If the classifier says auto-dismiss,
+      // we insert with status='dismissed' and a dismissed_by='auto_junk'.
+      // Existing customers, real humans with personal subjects, and
+      // first-touch potential clients are protected by the rules.
+      const classification = autoDismissJunk
+        ? await classifyEmail({
+            fromName: m.from,
+            fromEmail: m.fromEmail,
+            subject: m.subject,
+            body: m.body,
+          }, { customerEmails })
+        : { shouldDismiss: false, score: 0, signals: ['auto_dismiss_disabled'], reason: 'auto-dismiss off', classifiedBy: 'rules' };
+
+      const isAutoJunk = classification.shouldDismiss;
+      const status = isAutoJunk ? 'dismissed' : 'pending';
+      const dismissedBy = isAutoJunk ? (classification.classifiedBy === 'llm' ? 'auto_ai' : 'auto_junk') : null;
+
       db.prepare(`
-        INSERT INTO pending_emails (message_id, uid, from_name, from_email, subject, body, snippet, received_at, status, flagged)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        INSERT INTO pending_emails (message_id, uid, from_name, from_email, subject, body, snippet, received_at, status, flagged, dismissed_by, dismissed_reason, classification)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         m.messageId,
         String(m.uid || ''),
@@ -117,9 +147,19 @@ export async function scanPendingEmails(db, {
         m.body || '',
         m.snippet || '',
         m.date ? new Date(m.date).toISOString() : null,
-        m.flagged ? 1 : 0,
+        status,                          // col 9: status
+        m.flagged ? 1 : 0,                // col 10: flagged
+        dismissedBy,                      // col 11: dismissed_by
+        isAutoJunk ? classification.reason : null,  // col 12: dismissed_reason
+        JSON.stringify({ score: classification.score, signals: classification.signals, classified_by: classification.classifiedBy, classified_at: new Date().toISOString() }),  // col 13: classification
       );
-      result.inserted += 1;
+      if (isAutoJunk) {
+        result.auto_dismissed += 1;
+        db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('auto', 'pending_email.auto_dismiss', ?, ?)")
+          .run(m.messageId, JSON.stringify({ from: m.fromEmail, subject: m.subject, score: classification.score, reason: classification.reason, classified_by: classification.classifiedBy }));
+      } else {
+        result.inserted += 1;
+      }
     } catch (e) {
       result.errors.push({ messageId: m.messageId, error: e.message });
     }
@@ -140,7 +180,7 @@ export async function importPendingEmail(db, pendingId) {
   const row = db.prepare('SELECT * FROM pending_emails WHERE id = ?').get(pendingId);
   if (!row) throw new Error('pending email not found');
   if (row.status === 'imported') {
-    return { ticket: db.prepare('SELECT * FROM tickets WHERE id = ?').get(row.imported_ticket_id), customer: null, already_imported: true };
+    return { ticket: db.prepare('SELECT * FROM tickets WHERE id = ?').get(row.imported_ticket_id), customer: null, already_imported: true, contactMatch: null };
   }
   if (row.status === 'dismissed') throw new Error('pending email was dismissed');
 
@@ -174,15 +214,76 @@ export async function importPendingEmail(db, pendingId) {
     .run(tInfo.lastInsertRowid, pendingId);
   db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'pending_email.import', ?, ?)")
     .run(String(tInfo.lastInsertRowid), JSON.stringify({ pending_id: pendingId, from_email: row.from_email }));
-  return { ticket: db.prepare('SELECT * FROM tickets WHERE id = ?').get(tInfo.lastInsertRowid), customer, already_imported: false };
+  const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(tInfo.lastInsertRowid);
+
+  // Look up the sender in Google Contacts so the admin can pre-populate
+  // missing customer fields (phone, company, address). Best-effort:
+  // never throws, never blocks the import. Returns `contactMatch: null`
+  // if the lookup wasn't possible / no hit, in which case the UI just
+  // skips the enrichment modal.
+  let contactMatch = null;
+  try {
+    contactMatch = await findContactMatch({
+      email: row.from_email,
+      name: row.from_name,
+      existingCustomer: customer,
+    });
+  } catch (e) {
+    console.warn('[inbox] contact lookup failed:', e.message);
+  }
+
+  return { ticket, customer, already_imported: false, contactMatch };
 }
 
 export function dismissPendingEmail(db, pendingId) {
   const row = db.prepare('SELECT * FROM pending_emails WHERE id = ?').get(pendingId);
   if (!row) throw new Error('pending email not found');
   if (row.status !== 'pending') throw new Error(`cannot dismiss ${row.status} email`);
-  db.prepare("UPDATE pending_emails SET status='dismissed', decided_at=CURRENT_TIMESTAMP WHERE id=?").run(pendingId);
+  db.prepare("UPDATE pending_emails SET status='dismissed', dismissed_by='user', dismissed_at=CURRENT_TIMESTAMP, decided_at=CURRENT_TIMESTAMP WHERE id=?")
+    .run(pendingId);
   db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'pending_email.dismiss', ?)").run(String(pendingId));
+  return { ok: true };
+}
+
+/**
+ * Bulk-dismiss multiple pending emails. Whitelists the dismiss path: any
+ * ID that doesn't exist or isn't 'pending' is skipped (not an error).
+ * Returns counts so the UI can show "dismissed 5 of 7".
+ */
+export function bulkDismissPendingEmails(db, pendingIds) {
+  if (!Array.isArray(pendingIds) || pendingIds.length === 0) {
+    return { requested: 0, dismissed: 0, skipped: 0, errors: [] };
+  }
+  const ids = pendingIds.map(Number).filter((n) => Number.isInteger(n) && n > 0);
+  if (ids.length === 0) return { requested: pendingIds.length, dismissed: 0, skipped: 0, errors: [] };
+
+  const check = db.prepare(`SELECT id, status FROM pending_emails WHERE id IN (${ids.map(() => '?').join(',')})`).all(...ids);
+  const found = new Map(check.map((r) => [r.id, r.status]));
+  const dismissable = ids.filter((id) => found.get(id) === 'pending');
+  const skipped = ids.length - dismissable.length;
+
+  if (dismissable.length > 0) {
+    db.prepare(`UPDATE pending_emails SET status='dismissed', dismissed_by='user', dismissed_at=CURRENT_TIMESTAMP, decided_at=CURRENT_TIMESTAMP WHERE id IN (${dismissable.map(() => '?').join(',')})`)
+      .run(...dismissable);
+    db.prepare(`INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'pending_email.bulk_dismiss', NULL, ?)`)
+      .run(JSON.stringify({ ids: dismissable, count: dismissable.length }));
+  }
+  return { requested: ids.length, dismissed: dismissable.length, skipped, errors: [] };
+}
+
+/**
+ * Restore a dismissed email back to pending. Used by the "Restore" button
+ * on the "Show dismissed" view. Logs the action so we have an audit trail
+ * of mistakes (and corrections).
+ */
+export function restorePendingEmail(db, pendingId) {
+  const row = db.prepare('SELECT * FROM pending_emails WHERE id = ?').get(pendingId);
+  if (!row) throw new Error('pending email not found');
+  if (row.status !== 'dismissed') throw new Error(`cannot restore ${row.status} email — only dismissed rows can be restored`);
+  db.prepare("UPDATE pending_emails SET status='pending', dismissed_by=NULL, dismissed_reason=NULL, dismissed_at=NULL, decided_at=NULL WHERE id=?")
+    .run(pendingId);
+  db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'pending_email.restore', ?, ?)")
+    .run(String(pendingId), JSON.stringify({ was_dismissed_by: row.dismissed_by, reason: row.dismissed_reason }));
   return { ok: true };
 }
 
@@ -190,12 +291,21 @@ export function listPendingEmails(db, { status = 'pending', limit = 50, offset =
   // Optional date filtering: the list can be restricted to a window without
   // re-running the scan. The scan window is the "what we asked Gmail for";
   // this list window is "what we're looking at right now".
+  // `status` can be a string (single status) or array of statuses.
   let sql = `
-    SELECT id, message_id, uid, from_name, from_email, subject, snippet, received_at, status, imported_ticket_id, fetched_at, flagged
+    SELECT id, message_id, uid, from_name, from_email, subject, snippet, received_at, status, imported_ticket_id, fetched_at, flagged, dismissed_by, dismissed_reason, classification
     FROM pending_emails
-    WHERE status = ?
+    WHERE 1=1
   `;
-  const args = [status];
+  const args = [];
+  if (Array.isArray(status)) {
+    if (status.length === 0) return [];
+    sql += ` AND status IN (${status.map(() => '?').join(',')})`;
+    args.push(...status);
+  } else if (status) {
+    sql += ' AND status = ?';
+    args.push(status);
+  }
   if (since) { sql += ' AND received_at >= ?'; args.push(since); }
   if (until) { sql += ' AND received_at <= ?'; args.push(until); }
   // Newest email at the top. `received_at` is the email's actual send time;

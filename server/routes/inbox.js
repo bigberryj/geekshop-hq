@@ -18,6 +18,8 @@ import {
   scanPendingEmails,
   importPendingEmail,
   dismissPendingEmail,
+  bulkDismissPendingEmails,
+  restorePendingEmail,
   listPendingEmails,
 } from '../lib/pending-emails.js';
 
@@ -68,6 +70,10 @@ export async function inboxRoutes(app) {
     const status = (req.query.status || 'pending').toString();
     const limit = Math.min(Math.max(Number(req.query.limit) || 250, 1), 500);
     const offset = Math.max(Number(req.query.offset) || 0, 0);
+    // include_dismissed=true returns BOTH pending and dismissed rows.
+    // Used by the "Show dismissed" toggle in the UI. When true, the
+    // `status` param is ignored (we always return both).
+    const includeDismissed = String(req.query.include_dismissed || '').toLowerCase() === 'true';
     // Optional date window — ISO date strings, applied to received_at.
     // Bad date strings return 400 rather than silently ignoring the filter.
     const parseDate = (v) => {
@@ -86,20 +92,26 @@ export async function inboxRoutes(app) {
     if (since && until && new Date(since).getTime() > new Date(until).getTime()) {
       return reply.code(400).send({ error: 'since must be before until' });
     }
-    const items = listPendingEmails(app.db, { status, limit, offset, since, until });
+    // When include_dismissed, query both statuses. Pass as a list.
+    const effectiveStatus = includeDismissed ? ['pending', 'dismissed'] : status;
+    const items = listPendingEmails(app.db, { status: effectiveStatus, limit, offset, since, until });
     // `total` is the count under the same filter so the UI can show
     // "X of Y" correctly when the user has narrowed the date window.
-    const countSql = `SELECT COUNT(*) as n FROM pending_emails WHERE status = ?${since ? ' AND received_at >= ?' : ''}${until ? ' AND received_at <= ?' : ''}`;
-    const countArgs = [status];
-    if (since) countArgs.push(since);
-    if (until) countArgs.push(until);
-    const total = app.db.prepare(countSql).get(...countArgs).n;
+    const baseWhere = includeDismissed
+      ? `(status IN ('pending','dismissed'))`
+      : `status = ?`;
+    const baseArgs = includeDismissed ? [] : [status];
+    const whereParts = [baseWhere];
+    const whereArgs = [...baseArgs];
+    if (since) { whereParts.push('received_at >= ?'); whereArgs.push(since); }
+    if (until) { whereParts.push('received_at <= ?'); whereArgs.push(until); }
+    const total = app.db.prepare(`SELECT COUNT(*) as n FROM pending_emails WHERE ${whereParts.join(' AND ')}`).get(...whereArgs).n;
     return {
       items,
       rows: items, // alias for any client that still expects a flat array
       total,
       limit, offset,
-      filter: { since, until },
+      filter: { since, until, includeDismissed },
     };
   });
 
@@ -119,6 +131,34 @@ export async function inboxRoutes(app) {
       const id = Number(req.params.id);
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
       dismissPendingEmail(app.db, id);
+      return { ok: true };
+    } catch (err) {
+      return reply.code(400).send({ error: err.message });
+    }
+  });
+
+  // Bulk-dismiss multiple pending emails at once. UI sends a list of
+  // {id: number} objects in the body. Returns counts so the UI can show
+  // "dismissed 5 of 7" with the skipped rows explained.
+  app.post('/api/inbox/pending/bulk-dismiss', async (req, reply) => {
+    const { ids } = req.body || {};
+    if (!Array.isArray(ids)) return reply.code(400).send({ error: 'ids array required' });
+    if (ids.length > 500) return reply.code(400).send({ error: 'too many ids (max 500)' });
+    try {
+      const result = bulkDismissPendingEmails(app.db, ids);
+      return { ok: true, ...result };
+    } catch (err) {
+      return reply.code(400).send({ error: err.message });
+    }
+  });
+
+  // Restore a dismissed email back to pending. Used by the "Restore"
+  // button on the "Show dismissed" view.
+  app.post('/api/inbox/pending/:id/restore', async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
+    try {
+      restorePendingEmail(app.db, id);
       return { ok: true };
     } catch (err) {
       return reply.code(400).send({ error: err.message });

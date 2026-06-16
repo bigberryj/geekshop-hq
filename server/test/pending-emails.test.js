@@ -28,6 +28,15 @@ vi.mock('../lib/email-inbox.js', async () => {
   };
 });
 
+// Stub the Google Contacts lookup so unit tests don't make real API calls.
+// Tests that need to exercise the enrichment logic should override this.
+vi.mock('../lib/google-contacts.js', async () => {
+  return {
+    findContactMatch: vi.fn(async () => ({ ok: false, reason: 'no_match' })),
+    buildEnrichmentDiff: vi.fn(() => null),
+  };
+});
+
 let db;
 
 beforeAll(async () => {

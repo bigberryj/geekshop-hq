@@ -70,7 +70,14 @@ export function getTaxModel(key) {
  *   }
  */
 export function computeInvoiceTotals({ model = DEFAULT_TAX_MODEL, lineItems = [], tax_cents_override } = {}) {
-  const subtotal = lineItems.reduce((s, li) => s + (Number(li.qty) || 1) * (Number(li.unit_price) || 0), 0);
+  const subtotal = lineItems.reduce((s, li) => {
+    // Prefer pre-computed integer totals when present. Labour lines can use
+    // fractional hours, and after the private minimum-charge floor is applied
+    // the rounded display rate may not multiply back to the exact cents. The
+    // stored `total_cents` is the source of truth for invoice math.
+    if (Number.isFinite(Number(li.total_cents))) return s + Math.round(Number(li.total_cents));
+    return s + Math.round((Number(li.qty) || 1) * (Number(li.unit_price) || 0));
+  }, 0);
   const def = getTaxModel(model);
 
   let tax_lines;
@@ -136,4 +143,108 @@ export function applyLabourRate(entries = [], { rate_cents_per_hour, currency = 
     });
   }
   return lines;
+}
+
+/**
+ * Apply a private minimum-charge floor to a set of invoice line items.
+ *
+ * Important: this is BYRON's private accounting fact, not the customer's.
+ * The function boosts the unit_price on the existing labour lines so the
+ * total equals the floor — no "minimum charge" line is ever added. The
+ * customer sees a clean invoice; the admin sees the boost in the preview
+ * modal with a clear label.
+ *
+ * Only line items with `type: 'labour'` are boosted. Non-labour lines
+ * (parts, ad-hoc fees) are left alone — the floor applies to the work,
+ * not the parts. If the labour subtotal is already at or above the
+ * floor, the lines are returned unchanged.
+ *
+ * Distribution: the boost is distributed proportionally across labour
+ * lines by `total_cents`, then any rounding remainder (in cents) is
+ * added to the largest line so the sum equals the floor exactly. Hours
+ * (`qty`) are NOT changed — only `unit_price` and `total_cents`.
+ *
+ * Inputs:
+ *   lineItems: array of line items (mutated-clone, originals untouched)
+ *   floor_cents: integer >= 0 (0 = floor disabled, returns lines unchanged)
+ *
+ * Returns: {
+ *   line_items: new array (originals cloned, not mutated)
+ *   floor_applied: boolean
+ *   floor_cents: number (echoed back for display)
+ *   original_labour_subtotal_cents: number
+ *   boosted_labour_subtotal_cents: number
+ * }
+ */
+export function applyMinimumChargeFloor(lineItems = [], floor_cents = 0) {
+  const floor = Math.max(0, Math.floor(Number(floor_cents) || 0));
+  const labour = lineItems.filter((li) => li && li.type === 'labour');
+  const original_labour_subtotal_cents = labour.reduce(
+    (s, li) => s + (Number(li.total_cents) || 0),
+    0
+  );
+
+  // Floor disabled OR labour already meets it — return cloned lines untouched.
+  if (floor === 0 || original_labour_subtotal_cents >= floor) {
+    return {
+      line_items: lineItems.map((li) => ({ ...li })),
+      floor_applied: false,
+      floor_cents: floor,
+      original_labour_subtotal_cents,
+      boosted_labour_subtotal_cents: original_labour_subtotal_cents,
+    };
+  }
+
+  // Need to boost by `delta` cents. Distribute proportionally by total_cents.
+  const delta = floor - original_labour_subtotal_cents;
+  const total = original_labour_subtotal_cents;
+  const boosted = labour.map((li) => {
+    const base_total = Number(li.total_cents) || 0;
+    const share = total > 0 ? Math.floor((base_total / total) * delta) : Math.floor(delta / labour.length);
+    const new_total = base_total + share;
+    // Recompute unit_price to match: new_total / qty, rounded to whole cent.
+    const qty = Number(li.qty) || 0;
+    const new_unit_price = qty > 0 ? Math.round(new_total / qty) : new_total;
+    return { ...li, unit_price: new_unit_price, total_cents: new_total };
+  });
+
+  // Distribute the rounding remainder so boosted_labour_subtotal_cents === floor exactly.
+  const boosted_sum = boosted.reduce((s, li) => s + (Number(li.total_cents) || 0), 0);
+  const remainder = floor - boosted_sum;
+  if (remainder !== 0 && boosted.length > 0) {
+    // Put the remainder on the largest line so it's the least-visible change.
+    let largestIdx = 0;
+    for (let i = 1; i < boosted.length; i++) {
+      if (boosted[i].total_cents > boosted[largestIdx].total_cents) largestIdx = i;
+    }
+    boosted[largestIdx] = {
+      ...boosted[largestIdx],
+      total_cents: boosted[largestIdx].total_cents + remainder,
+      unit_price:
+        (Number(boosted[largestIdx].qty) || 0) > 0
+          ? Math.round((boosted[largestIdx].total_cents + remainder) / boosted[largestIdx].qty)
+          : boosted[largestIdx].unit_price + remainder,
+    };
+  }
+
+  // Recombine: keep original order — boost labour lines in place, leave others alone.
+  // Use position, not source_time_entry_id, so ad-hoc labour lines without a
+  // source id don't all collapse onto the same Map key.
+  let boostedIdx = 0;
+  const recombined = lineItems.map((li) => {
+    if (li && li.type === 'labour') {
+      const next = boosted[boostedIdx];
+      boostedIdx += 1;
+      return next ? { ...next } : { ...li };
+    }
+    return { ...li };
+  });
+
+  return {
+    line_items: recombined,
+    floor_applied: true,
+    floor_cents: floor,
+    original_labour_subtotal_cents,
+    boosted_labour_subtotal_cents: floor,
+  };
 }

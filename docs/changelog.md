@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-16 — Gmail moderation, Contacts enrichment, and invoice minimum charge
+
+- Added strict Gmail junk classification for pending scan entries. Obvious junk is soft-dismissed with `dismissed_by`, `dismissed_reason`, `classification` JSON, and `dismissed_at`; ambiguous/client-like mail stays pending.
+- Added Gmail queue bulk moderation UI: row checkboxes, **Dismiss N selected**, **Show dismissed**, dismissed status badges, and **Restore**.
+- Added Google Contacts enrichment after import: server finds a likely contact via the existing OAuth token and the UI prompts before applying blank-field customer updates. Nothing overwrites existing customer data automatically.
+- Added private minimum-charge support for time-based invoice drafts:
+  - `settings.minimum_charge_cents` controls the default floor.
+  - Money page now opens an invoice draft preview modal instead of creating immediately.
+  - The admin can toggle/override the floor per invoice.
+  - The floor is folded into labour line prices and never appears as a customer-visible “minimum charge” line.
+- Fixed invoice math to treat `line_items[].total_cents` as the cents source of truth when present, avoiding fractional-hour/rounded-rate drift.
+- Added/updated docs: `docs/schema.md`, `docs/api.md`, `docs/security.md`.
+- Verification: backend test suite green at 117/117; client production build green; browser-tested Inbox bulk dismiss/show dismissed/restore, Settings minimum-charge field, and Money minimum-charge preview modal.
+
 ## 2026-06-15 — Inbox fix: Gmail scan returns 0 messages
 
 - **Root cause:** `imapflow`'s `client.fetch(uidArray, { uid: true, ... })` was returning zero messages on this Gmail mailbox — server said `OK Success` but emitted no `* N FETCH (...)` response lines. UIDVALIDITY was stable, UIDs were valid (205967 = uidNext-1), but the FETCH iterator never yielded.

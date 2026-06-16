@@ -7,6 +7,7 @@ import { renderInvoiceText, renderInvoiceHtml } from '../lib/invoice-renderer.js
 import {
   computeInvoiceTotals,
   applyLabourRate,
+  applyMinimumChargeFloor,
   DEFAULT_TAX_MODEL,
   getTaxModel,
 } from '../lib/tax.js';
@@ -77,10 +78,23 @@ export async function invoiceRoutes(app) {
   });
 
   // Pre-fill helper: take a customer's un-invoiced time entries and convert
-  // them into invoice line items at the configured labour rate.
-  // Body: { customer_id, tax_model? }
+  // them into invoice line items at the configured labour rate, with the
+  // optional private minimum-charge floor applied to labour lines.
+  //
+  // Body: {
+  //   customer_id,
+  //   tax_model?,
+  //   min_charge_apply?: boolean      (default: true if min_charge_cents > 0)
+  //   min_charge_cents_override?: number (per-invoice override of the setting)
+  // }
+  //
+  // Returns: {
+  //   line_items, ...tax totals,
+  //   rate_cents_per_hour,
+  //   floor: { applied, configured_cents, effective_cents, original_labour_subtotal_cents, boosted_labour_subtotal_cents }
+  // }
   app.post('/api/invoices/draft-from-time', async (req, reply) => {
-    const { customer_id, tax_model } = req.body || {};
+    const { customer_id, tax_model, min_charge_apply, min_charge_cents_override } = req.body || {};
     if (!customer_id) return reply.code(400).send({ error: 'customer_id required' });
 
     const rate = intCents(readSetting(app.db, 'labour_rate_cents_per_hour', 10000)); // default $100/h
@@ -93,16 +107,51 @@ export async function invoiceRoutes(app) {
       ORDER BY te.started_at ASC
     `).all(customer_id);
 
-    const lineItems = applyLabourRate(entries, { rate_cents_per_hour: rate });
-    if (!lineItems.length) {
+    const rawLines = applyLabourRate(entries, { rate_cents_per_hour: rate });
+    if (!rawLines.length) {
       return reply.code(400).send({ error: 'no uninvoiced time entries for this customer' });
     }
+
+    // Minimum charge floor. Default: applied if a floor is configured (> 0).
+    const configuredFloor = intCents(readSetting(app.db, 'minimum_charge_cents', 0)) || 0;
+    const overrideFloor = intCents(min_charge_cents_override);
+    const effectiveFloor = overrideFloor != null ? overrideFloor : configuredFloor;
+    const applyFloor = min_charge_apply === false ? false : effectiveFloor > 0;
+
+    const floorResult = applyMinimumChargeFloor(rawLines, applyFloor ? effectiveFloor : 0);
+    const lineItems = floorResult.line_items;
+
     const defaultModel = readSetting(app.db, 'default_tax_model', DEFAULT_TAX_MODEL);
     const totals = computeInvoiceTotals({
       model: tax_model || defaultModel,
       lineItems,
     });
-    return { line_items: lineItems, ...totals, rate_cents_per_hour: rate };
+    return {
+      line_items: lineItems,
+      ...totals,
+      rate_cents_per_hour: rate,
+      floor: {
+        applied: floorResult.floor_applied,
+        configured_cents: configuredFloor,
+        effective_cents: applyFloor ? effectiveFloor : 0,
+        original_labour_subtotal_cents: floorResult.original_labour_subtotal_cents,
+        boosted_labour_subtotal_cents: floorResult.boosted_labour_subtotal_cents,
+      },
+    };
+  });
+
+  // Preview-only variant of draft-from-time. Same shape, but never creates
+  // anything. Used by the Money page modal to show "here's what your invoice
+  // would look like" before the user confirms.
+  app.post('/api/invoices/draft-preview', async (req, reply) => {
+    // Re-use the draft handler — it already only computes, doesn't persist.
+    const res = await app.inject({
+      method: 'POST',
+      url: '/api/invoices/draft-from-time',
+      payload: req.body || {},
+    });
+    reply.code(res.statusCode);
+    return res.json();
   });
 
   // Mark selected time entries as invoiced (call after a successful create).
