@@ -29,14 +29,38 @@ export async function inboxRoutes(app) {
 
   app.post('/api/inbox/test', async () => testConnection());
 
-  // Manual "check Gmail now" button for the admin
+  // Manual "check Gmail now" button for the admin.
+  //
+  // Query params (all optional):
+  //   since           ISO date string  earliest message date (default: now - 24h)
+  //   until           ISO date string  latest message date (default: none)
+  //   include_starred "true"|"false"   include \Flagged (starred) messages (default: true)
+  //   limit           number 1..100     max messages to fetch (default: 25)
   app.post('/api/inbox/scan', async (req, reply) => {
     try {
-      const limit = Math.min(Number(req.query.limit) || 25, 100);
-      const result = await scanPendingEmails(app.db, { limit });
+      // Accept params from either query string or JSON body (the UI form
+      // will send JSON; curl-friendly callers can use either).
+      const src = { ...(req.query || {}), ...((req.body && typeof req.body === 'object') ? req.body : {}) };
+      const parseDate = (v, fallback) => {
+        if (v == null || v === '') return fallback;
+        const d = new Date(v);
+        if (isNaN(d.getTime())) throw new Error(`invalid date: ${v}`);
+        return d;
+      };
+      const since = parseDate(src.since, new Date(Date.now() - 24 * 60 * 60 * 1000));
+      const until = parseDate(src.until, null);
+      const includeStarred = String(src.include_starred ?? src.includeStarred ?? 'true').toLowerCase() !== 'false';
+      const limit = Math.min(Math.max(Number(src.limit) || 25, 1), 100);
+      if (since && until && since.getTime() > until.getTime()) {
+        return reply.code(400).send({ error: 'since must be before until' });
+      }
+      const result = await scanPendingEmails(app.db, { since, until, includeStarred, limit });
       return result;
     } catch (err) {
-      return reply.code(500).send({ error: err.message });
+      // 400 for caller-fixable errors (bad date, inverted range), 500 for
+      // anything else (IMAP down, DB error).
+      const status = /invalid date|since must be/i.test(err.message) ? 400 : 500;
+      return reply.code(status).send({ error: err.message });
     }
   });
 
@@ -61,7 +85,7 @@ export async function inboxRoutes(app) {
     try {
       const id = Number(req.params.id);
       if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
-      const result = importPendingEmail(app.db, id);
+      const result = await importPendingEmail(app.db, id);
       return { ok: true, ...result, already_imported: Boolean(result.already_imported) };
     } catch (err) {
       return reply.code(400).send({ error: err.message });

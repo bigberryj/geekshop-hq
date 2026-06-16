@@ -35,44 +35,115 @@ async function withClient(fn) {
 }
 
 /**
- * Fetch recent unread messages (max `limit`, default 25).
- * Returns [{ messageId, from, fromEmail, subject, date, body, snippet, uid }]
+ * Fetch recent unread + (optionally) starred messages within a date window.
+ * Returns [{ messageId, from, fromEmail, subject, date, body, snippet, uid, flagged }]
+ *
+ * Options:
+ *   - since:     Date   earliest message date to include. Default = now - 24h.
+ *   - until:     Date   latest message date to include. Default = no upper bound.
+ *   - includeStarred: boolean  if true, also pull \Flagged (Gmail "starred")
+ *                      messages, even if read. Default true for the manual scan.
+ *   - limit:     number max messages to fetch. Hard cap 100.
  */
-export async function fetchUnread(limit = 25) {
+export async function fetchUnread({
+  since,
+  until,
+  includeStarred = true,
+  limit = 25,
+} = {}) {
+  if (!(since instanceof Date)) since = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const cappedLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
+  // IMAP SINCE / BEFORE search keys take a JS Date.
+  // "Recent first" ordering: we don't trust the server's sort so we sort
+  // ourselves by internalDate after fetch.
   return withClient(async (client) => {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Search returns *sequence numbers* (we pass uid:false deliberately).
-      // On this Gmail mailbox, FETCH with `uid: true` + a list of UIDs from
-      // SEARCH silently returns zero messages — server says "OK Success" but
-      // emits no FETCH data. Fetching by sequence-number range works.
-      // See: https://github.com/postalsys/imapflow/issues (Gmail CONDSTORE quirk)
-      const seqs = await client.search({ unseen: true });
-      if (!seqs.length) return [];
-      const recent = seqs.slice(-limit).reverse();
-      const out = [];
-      // Build a sequence-range string: "848:850"
+      // Two search keys:
+      //   1) unread within window  (always)
+      //   2) starred within window (if includeStarred)
+      // We OR them at the IMAP level so the server filters before we fetch
+      // bodies, which is the difference between ~50ms and a multi-second
+      // body fetch on a big mailbox.
+      const searchKey = { since, ...(until ? { before: until } : {}), or: true };
+      const searches = [{ ...searchKey, unseen: true }];
+      if (includeStarred) searches.push({ ...searchKey, flagged: true });
+
+      // Collect sequence numbers across both searches, deduped.
+      const seqSet = new Set();
+      for (const k of searches) {
+        const s = await client.search(k);
+        for (const n of s) seqSet.add(n);
+      }
+      const allSeqs = [...seqSet];
+      if (!allSeqs.length) return [];
+      // Most recent first: sort by sequence number descending (highest = newest).
+      allSeqs.sort((a, b) => b - a);
+      const recent = allSeqs.slice(0, cappedLimit);
       const range = recent.length === 1
         ? String(recent[0])
         : `${recent[0]}:${recent[recent.length - 1]}`;
-      console.log('[inbox] fetchUnread: seqs', recent, 'range', range);
-      const fetchOpts = { envelope: true, source: true, flags: true, internalDate: true };
-      for await (const msg of client.fetch(range, fetchOpts)) {
-        const source = msg.source;
-        if (!source) continue;
-        const parsed = await simpleParser(source);
-        const from = parsed.from?.value?.[0];
-        out.push({
-          uid: msg.uid, // still populated by the server
-          messageId: parsed.messageId || String(msg.uid),
-          from: from?.name || from?.address || '(unknown)',
-          fromEmail: from?.address || '',
-          subject: parsed.subject || '(no subject)',
-          date: parsed.date || msg.internalDate,
-          body: parsed.text || parsed.html || '',
-          snippet: (parsed.text || '').slice(0, 200).replace(/\s+/g, ' ').trim(),
+      console.log('[inbox] fetchUnread: seqs', recent.length, 'range', range, 'since', since.toISOString());
+      // Fetch metadata-only first (envelope, flags) to filter cheaply, then
+      // pull bodies in parallel only for messages that survive the date
+      // filter. This avoids paying the body-transfer cost for 100 large
+      // messages when the user only needs a handful within the window.
+      const metaOpts = { envelope: true, flags: true, internalDate: true, uid: true };
+      const candidates = [];
+      for await (const msg of client.fetch(range, metaOpts)) {
+        const d = msg.internalDate || new Date(msg.envelope?.date || 0);
+        if (d.getTime() < since.getTime() - 1000) continue;
+        if (until && d.getTime() > until.getTime() + 1000) continue;
+        const envFrom = msg.envelope?.from?.[0];
+        candidates.push({
+          uid: msg.uid,
+          seq: msg.seq,
+          internalDate: d,
+          flagged: !!(msg.flags && msg.flags.has('\\Flagged')),
+          // Capture envelope metadata so bodyless rows still render properly
+          fromName: envFrom?.name || null,
+          fromEmail: envFrom?.address || null,
+          subject: msg.envelope?.subject || null,
         });
       }
+      // Now fetch bodies — but only for the most recent 25, since the
+      // snippet we extract is what's shown in the queue UI and the
+      // full body is only needed at import time. Older entries get
+      // envelope-only metadata. IMAP fetch on a single connection is
+      // serial anyway, so this is the same as parallel but clearer.
+      const BODY_FETCH_LIMIT = 25;
+      const out = [];
+      for (let i = 0; i < candidates.length; i++) {
+        const cand = candidates[i];
+        let parsed = null;
+        if (i < BODY_FETCH_LIMIT) {
+          try {
+            const seqRange = String(cand.seq);
+            for await (const m of client.fetch(seqRange, { source: true, uid: true })) {
+              parsed = await simpleParser(m.source);
+              break;
+            }
+          } catch (e) {
+            console.warn('[inbox] body fetch failed for uid', cand.uid, e.message);
+          }
+        }
+        const from = parsed?.from?.value?.[0] || (cand.fromEmail ? { name: cand.fromName, address: cand.fromEmail } : null);
+        const subject = parsed?.subject || cand.subject || '(no subject)';
+        const text = parsed?.text || parsed?.html || '';
+        out.push({
+          uid: cand.uid,
+          messageId: parsed?.messageId || String(cand.uid),
+          from: from?.name || from?.address || cand.fromName || cand.fromEmail || '(unknown)',
+          fromEmail: from?.address || cand.fromEmail || '',
+          subject,
+          date: parsed?.date || cand.internalDate,
+          body: text,
+          snippet: text ? text.slice(0, 200).replace(/\s+/g, ' ').trim() : (subject || '').slice(0, 200),
+          flagged: cand.flagged,
+        });
+      }
+      // Sort by date descending — Gmail's seq order can be off for threads.
+      out.sort((a, b) => (b.date?.getTime?.() || 0) - (a.date?.getTime?.() || 0));
       return out;
     } finally {
       lock.release();
@@ -255,12 +326,20 @@ export function startPoller({ onNewMessage, intervalMin = POLL_MIN } = {}) {
 
   const seen = loadSeen();
   let running = false;
+  // Track the last successful poll timestamp so the background poller
+  // never re-pulls old starred mail. Manual scans are still allowed to
+  // override the window via the API.
+  let lastPollAt = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const tick = async () => {
     if (running) return;
     running = true;
     try {
-      const msgs = await fetchUnread(50);
+      // The poller is constrained to "since last successful poll" to avoid
+      // re-fetching the same starred messages every 5 minutes. This is a
+      // tighter window than the manual scan's 24h default.
+      const since = lastPollAt;
+      const msgs = await fetchUnread({ since, includeStarred: true, limit: 50 });
       const fresh = msgs.filter((m) => !seen.has(m.messageId));
       if (fresh.length) {
         console.log(`[inbox] ${fresh.length} new message(s) since last poll`);
@@ -272,6 +351,7 @@ export function startPoller({ onNewMessage, intervalMin = POLL_MIN } = {}) {
         }
         saveSeen(seen);
       }
+      lastPollAt = new Date();
     } catch (e) {
       console.warn('[inbox] poll error:', e.message);
     } finally {
