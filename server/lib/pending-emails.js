@@ -11,7 +11,7 @@
 
 import { fetchUnread, fetchByMessageId, inboxConfig } from './email-inbox.js';
 import { findContactMatch } from './google-contacts.js';
-import { classifyEmail } from './junk-classifier.js';
+import { classifyEmail, scoreEmail, isAgentMail } from './junk-classifier.js';
 
 function findOrCreateCustomer(db, { email, name }) {
   if (email) {
@@ -68,6 +68,9 @@ export async function scanPendingEmails(db, {
   const customerEmails = new Set(
     db.prepare("SELECT email FROM customers WHERE email IS NOT NULL AND email != ''").all().map((r) => r.email.toLowerCase())
   );
+  // Pre-load moderation settings (junk override lists + agent mailbox)
+  // so the same rules the backfill uses are applied during a live scan.
+  const moderationSettings = readModerationSettings(db);
 
   for (const m of messages) {
     try {
@@ -128,7 +131,7 @@ export async function scanPendingEmails(db, {
             fromEmail: m.fromEmail,
             subject: m.subject,
             body: m.body,
-          }, { customerEmails })
+          }, { customerEmails, settings: moderationSettings })
         : { shouldDismiss: false, score: 0, signals: ['auto_dismiss_disabled'], reason: 'auto-dismiss off', classifiedBy: 'rules' };
 
       const isAutoJunk = classification.shouldDismiss;
@@ -314,6 +317,155 @@ export function listPendingEmails(db, { status = 'pending', limit = 50, offset =
   sql += ' ORDER BY received_at DESC, id DESC LIMIT ? OFFSET ?';
   args.push(limit, offset);
   return db.prepare(sql).all(...args);
+}
+
+/**
+ * Read all the moderation settings (junk classifier overrides + agent
+ * mailbox) from the `settings` table and return them in a shape
+ * scoreEmail() / isAgentMail() understand. Single source of truth so
+ * the classifier never reads the DB directly.
+ */
+export function readModerationSettings(db) {
+  const rows = db.prepare('SELECT key, value FROM settings').all();
+  const map = Object.fromEntries(rows.map((r) => [r.key, r.value]));
+  return {
+    auto_dismiss_domains: map.auto_dismiss_domains || '',
+    auto_keep_subjects: map.auto_keep_subjects || '',
+    agent_mailbox_from: map.agent_mailbox_from || 'johnn5wizbot@gmail.com',
+  };
+}
+
+/**
+ * Backfill classification on all pending rows that don't yet have one
+ * (`classification IS NULL` or empty). Byron-iter 2026-06-16: the
+ * classifier was wired into `scanPendingEmails` after the existing 554
+ * rows were inserted, so they have null classification. This is the
+ * catch-up pass.
+ *
+ * For each row:
+ *   - run scoreEmail() (rules only, no LLM cost — this is a one-shot
+ *     admin action, not a hot path)
+ *   - if the score is >= `dismiss_threshold` (default 0.8), auto-dismiss
+ *     the row (status='dismissed', dismissed_by='auto_junk', reason=
+ *     the classifier's reason text). Writes audit_log.
+ *   - always persist the classification JSON so future audits can
+ *     see what the rules thought.
+ *
+ * Options:
+ *   dismiss_threshold: number (default 0.8) — only auto-dismiss rows
+ *     scoring at or above this. Use a higher value for more conservative
+ *     backfill, lower to be more aggressive. Even rows below the
+ *     threshold get their classification persisted.
+ *   status: 'pending' | 'all' (default 'pending') — which rows to
+ *     re-classify. 'all' also re-classifies already-dismissed rows
+ *     (useful after tuning the rules).
+ *   limit: number (default Infinity) — safety cap. Big DBs may want
+ *     to backfill in batches.
+ *
+ * Returns:
+ *   { examined, classified, dismissed, skipped, threshold, samples }
+ *     - examined: total rows looked at
+ *     - classified: rows that had a fresh classification computed
+ *     - dismissed: rows newly auto-dismissed by this pass
+ *     - skipped: rows that already had classification (and were not
+ *       touched unless `status === 'all'`)
+ *     - threshold: the threshold used
+ *     - samples: up to 25 (subject, from, score, signals) examples
+ *       for the audit log / admin review
+ */
+export function backfillClassifyPendingEmails(db, { dismiss_threshold = 0.8, status = 'pending', limit = Infinity } = {}) {
+  const settings = readModerationSettings(db);
+  const customerEmails = new Set(
+    db.prepare("SELECT email FROM customers WHERE email IS NOT NULL AND email != ''").all().map((r) => r.email.toLowerCase())
+  );
+
+  // Pick the candidate rows. Two cases:
+  //  - status='pending' (default): only pending rows, only those with
+  //    NULL/empty classification (so we don't redo work).
+  //  - status='all': re-classify every row, including already-dismissed.
+  let sql = `SELECT id, message_id, COALESCE(from_name,'') AS from_name, COALESCE(from_email,'') AS from_email, COALESCE(subject,'') AS subject, COALESCE(body,'') AS body, COALESCE(snippet,'') AS snippet, COALESCE(classification,'') AS classification, status FROM pending_emails`;
+  const args = [];
+  if (status === 'pending') {
+    sql += ` WHERE status = 'pending' AND (classification IS NULL OR classification = '')`;
+  }
+  sql += ` ORDER BY id ASC LIMIT ?`;
+  args.push(Number.isFinite(limit) ? limit : 1_000_000);
+
+  const candidates = db.prepare(sql).all(...args);
+  const result = { examined: candidates.length, classified: 0, dismissed: 0, skipped: 0, threshold: dismiss_threshold, samples: [] };
+
+  const updateStmt = db.prepare(`
+    UPDATE pending_emails
+    SET classification = ?
+    WHERE id = ?
+  `);
+  const dismissStmt = db.prepare(`
+    UPDATE pending_emails
+    SET status = 'dismissed',
+        dismissed_by = 'auto_junk',
+        dismissed_reason = ?,
+        dismissed_at = CURRENT_TIMESTAMP,
+        decided_at = COALESCE(decided_at, CURRENT_TIMESTAMP),
+        classification = ?
+    WHERE id = ?
+  `);
+  const auditStmt = db.prepare(`
+    INSERT INTO audit_log (actor, action, target, payload)
+    VALUES ('auto', 'pending_email.backfill_classify', ?, ?)
+  `);
+
+  for (const r of candidates) {
+    const classification = scoreEmail(
+      {
+        fromName: r.from_name,
+        fromEmail: r.from_email,
+        subject: r.subject,
+        body: r.body,
+      },
+      { customerEmails, settings }
+    );
+    const json = JSON.stringify({
+      score: classification.score,
+      signals: classification.signals,
+      classified_by: 'rules',
+      classified_at: new Date().toISOString(),
+    });
+    if (classification.shouldDismiss && r.status === 'pending') {
+      dismissStmt.run(classification.reason, json, r.id);
+      auditStmt.run(String(r.id), JSON.stringify({
+        from: r.from_email,
+        subject: r.subject,
+        score: classification.score,
+        signals: classification.signals,
+        threshold: dismiss_threshold,
+        reason: classification.reason,
+      }));
+      result.dismissed += 1;
+    } else {
+      updateStmt.run(json, r.id);
+    }
+    result.classified += 1;
+    if (result.samples.length < 25) {
+      result.samples.push({
+        id: r.id,
+        from_email: r.from_email,
+        subject: r.subject,
+        score: classification.score,
+        should_dismiss: classification.shouldDismiss,
+        signals: classification.signals,
+      });
+    }
+  }
+  return result;
+}
+
+/**
+ * Returns true if a pending row's from_email is in the agent mailbox
+ * settings list. Thin wrapper so the UI doesn't import the settings
+ * table directly.
+ */
+export function pendingEmailIsAgentMail(db, row) {
+  return isAgentMail(row?.from_email || '', readModerationSettings(db));
 }
 
 export { inboxConfig };

@@ -65,6 +65,16 @@ No cron prompts, scripts, or secrets are exposed.
 - `POST /inbox/pending/:id/restore`
   - Restores a dismissed row to `status='pending'` and clears dismissal fields.
 
+### Gmail moderation settings
+
+- `GET /inbox/moderation-settings`
+  - Returns the three settings the junk classifier reads at scan time:
+    `{ auto_dismiss_domains, auto_keep_subjects, agent_mailbox_from }`.
+- `POST /inbox/pending/backfill-classify`
+  - Body: `{ threshold?: number (0..1, default 0.8), status?: 'pending' | 'all' (default 'pending'), limit?: number (1..100000) }`.
+  - One-shot admin action. Classifies every un-classified pending row with the current rules, persists the classification JSON, and auto-dismisses any scoring ≥ `threshold`. Idempotent — safe to re-run after tuning the rules.
+  - Returns `{ examined, classified, dismissed, threshold, samples }`. `samples` is up to 25 (subject, from, score, signals) examples for audit.
+
 ## Tickets
 
 - `POST /tickets/:id/email-reply`

@@ -1,5 +1,19 @@
 # Changelog
 
+## 2026-06-16 — Gmail junk classifier: backfill, fixes, and settings tuning
+
+- **Fixed `isLikelyHuman` over-trigger bug.** The old heuristic treated the email local part as a display name when `from_name` was empty, so senders like `invoice+statements+acct_1HNrvlCJoPsRzQsd@stripe.com` (Stripe receipts) and `catch@payments.interac.ca` (Interac e-Transfer alerts) were being scored 0.0 and never auto-dismissed. The fix only inspects the explicit `from_name` field.
+- **Backfilled classification on the 554 un-classified legacy rows.** A one-shot admin action at `POST /api/inbox/pending/backfill-classify` (also exposed as a **Classify legacy** button in the Inbox UI) ran the rules-first classifier on every un-classified row, persisted the classification JSON, and auto-dismissed 62 of them with `dismissed_by='auto_junk'`. Queue went from `556 pending / 213 dismissed` → `494 pending / 275 dismissed`. Idempotent.
+- **Added a security/account-recovery always-keep list.** Subjects like "Your Google Account is no longer recoverable", "Security alert", "Unrecognized device signed in" are now never auto-dismissed, even if the sender is a noreply@.
+- **Added Google-ecosystem and transactional/receipt subject patterns.** `*noreply@google.com`, `accounts.google.com`, `docs.google.com`, plus "payment posted", "thank you for your payment", "auto deposited", "e-Transfer" subjects now score 0.4–0.5 on their own, which combines with brand + unsubscribe to push them over the 0.8 threshold.
+- **Added a settings-backed tuning surface** in the Settings page (under "Gmail moderation (junk classifier)"). Three CSV lists:
+  - `auto_dismiss_domains` — exact-match domains that always count as junk (adds 0.6 to the score).
+  - `auto_keep_subjects` — substrings of subjects that are NEVER auto-dismissed.
+  - `agent_mailbox_from` — from_email values that are operational agent traffic.
+- **Added a "Hide agent mail" toggle in the Inbox UI.** Persists in localStorage. When on, the agent-mailbox list is hidden from the human-pending view (the data is still in the DB and the toggle does not affect server data). Header reports `(... agent mail hidden)` so the queue size doesn't lie.
+- **Tests:** 144/144 passing (was 117/117). Added 27 new tests for the bug fix, new always-keep list, Google ecosystem signals, transactional subject patterns, settings-backed overrides, the `isAgentMail` helper, and the backfill function.
+- **Docs:** `docs/schema.md`, `docs/api.md`, `docs/security.md` updated. Changelog + solution doc updated.
+
 ## 2026-06-16 — Gmail moderation, Contacts enrichment, and invoice minimum charge
 
 - Added strict Gmail junk classification for pending scan entries. Obvious junk is soft-dismissed with `dismissed_by`, `dismissed_reason`, `classification` JSON, and `dismissed_at`; ambiguous/client-like mail stays pending.

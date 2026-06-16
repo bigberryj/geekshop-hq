@@ -117,6 +117,36 @@ export default function Settings() {
       </section>
 
       <section className="card mb-4">
+        <h3 className="font-semibold mb-3">Gmail moderation (junk classifier)</h3>
+        <p className="text-xs text-slate-500 mb-3">
+          These three settings tune the rules-first junk classifier without editing code.
+          The classifier runs on every Gmail scan, plus a one-shot backfill on the legacy
+          queue from the Inbox page. All three fields are private/admin-only.
+        </p>
+
+        <ListField
+          label="Auto-dismiss domains"
+          hint="Comma-separated. Each adds 0.6 to the score. Used for senders that are always junk (marketing, app promos, etc.). Example: mail.cargurus.com, googlenews-noreply.google.com"
+          value={settings.auto_dismiss_domains || ''}
+          onSave={(v) => update('auto_dismiss_domains', v)}
+        />
+
+        <ListField
+          label="Always-keep subjects"
+          hint="Comma-separated substrings. Subjects matching ANY of these are NEVER auto-dismissed, even if the sender is a noreply@. Used for security alerts, account-recovery, etc."
+          value={settings.auto_keep_subjects || ''}
+          onSave={(v) => update('auto_keep_subjects', v)}
+        />
+
+        <ListField
+          label="Agent mailbox(es)"
+          hint="Comma-separated from_email values. Mail from these addresses is operational agent traffic. It stays in the queue by default; the Inbox UI's 'Hide agent mail' toggle hides them from the human-pending view."
+          value={settings.agent_mailbox_from || 'johnn5wizbot@gmail.com'}
+          onSave={(v) => update('agent_mailbox_from', v)}
+        />
+      </section>
+
+      <section className="card mb-4">
         <h3 className="font-semibold mb-3">AI provider (two-tier)</h3>
         <p className="text-xs text-slate-500 mb-3">High-reasoning tasks (reply drafts, summary, extraction) use the provider below. Cheap/fast tasks (classification, nudges) use the other.</p>
         <div className="grid grid-cols-2 gap-4">
@@ -176,6 +206,21 @@ function Field({ label, value, onSave, type = 'text' }) {
         <input className="input" type={type} value={v} onChange={(e) => setV(e.target.value)} />
         <button className="btn-secondary" onClick={() => onSave(v)}>Save</button>
       </div>
+    </div>
+  );
+}
+
+function ListField({ label, hint, value, onSave }) {
+  const [v, setV] = useState(value);
+  useEffect(() => { setV(value); }, [value]);
+  return (
+    <div className="mb-3 max-w-2xl">
+      <label className="label">{label}</label>
+      <div className="flex gap-2">
+        <input className="input font-mono text-xs" value={v} onChange={(e) => setV(e.target.value)} placeholder="comma,separated,list" />
+        <button className="btn-secondary" onClick={() => onSave(v)}>Save</button>
+      </div>
+      {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
     </div>
   );
 }

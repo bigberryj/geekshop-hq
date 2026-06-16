@@ -25,10 +25,12 @@ Customers should not know GeekShop HQ is a ticket system.
 ## Gmail review queue safety
 
 - Gmail scans park entries in `pending_emails` only. They do **not** create customers or requests until the admin clicks **Import**.
-- Junk classification is strict by design. Existing customers, likely human senders, personal replies, and ambiguous messages stay pending.
+- Junk classification is rules-first with an LLM fallback for ambiguous cases. The rules-first path is intentionally strict: existing customers, likely human senders, personal replies, and ambiguous messages stay pending.
 - Auto-dismissed rows remain in the database with classification metadata and can be restored from **Show dismissed**.
 - Bulk dismiss is a soft state change (`status='dismissed'`), not a hard delete.
 - Google Contacts enrichment is preview-then-apply: the server may return suggested blank-field updates, but customer data is not changed until the admin clicks **Apply selected**.
+- Security / account-recovery subjects ("Your Google Account is no longer recoverable", "Security alert", "Unrecognized device signed in", etc.) are NEVER auto-dismissed, even if the sender is a `noreply@`. Tested in `server/test/junk-classifier.test.js`.
+- The classifier accepts three settings-backed overrides so tuning doesn't require code changes: `auto_dismiss_domains` (CSV exact-match domains, +0.6 score), `auto_keep_subjects` (CSV substring subjects, hard keep), and `agent_mailbox_from` (CSV from_email values used by the "Hide agent mail" UI toggle). All three are private/admin-only.
 
 ## Billing and invoices
 

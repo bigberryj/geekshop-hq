@@ -21,6 +21,8 @@ import {
   bulkDismissPendingEmails,
   restorePendingEmail,
   listPendingEmails,
+  backfillClassifyPendingEmails,
+  readModerationSettings,
 } from '../lib/pending-emails.js';
 
 export async function inboxRoutes(app) {
@@ -162,6 +164,47 @@ export async function inboxRoutes(app) {
       return { ok: true };
     } catch (err) {
       return reply.code(400).send({ error: err.message });
+    }
+  });
+
+  // Read the moderation settings (junk override lists + agent mailbox)
+  // for the UI. Exposed read-only.
+  app.get('/api/inbox/moderation-settings', async () => readModerationSettings(app.db));
+
+  // Backfill classification on pending rows that don't have one yet.
+  // Byron-iter 2026-06-16: the legacy queue has 554 un-classified rows
+  // from before the classifier shipped. This is the catch-up.
+  //
+  // Body: { threshold?: number (0..1, default 0.8),
+  //         status?: 'pending' | 'all' (default 'pending'),
+  //         limit?: number (default 100000) }
+  //
+  // Returns: { examined, classified, dismissed, threshold, samples }
+  //   - `samples` is up to 25 examples of what got scored + dismissed.
+  app.post('/api/inbox/pending/backfill-classify', async (req, reply) => {
+    const body = req.body || {};
+    const threshold = Number(body.threshold);
+    const status = String(body.status || 'pending');
+    const limit = Number(body.limit);
+    if (status !== 'pending' && status !== 'all') {
+      return reply.code(400).send({ error: "status must be 'pending' or 'all'" });
+    }
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 1) {
+      return reply.code(400).send({ error: 'threshold must be a number in [0, 1]' });
+    }
+    if (!Number.isFinite(limit) || limit < 1 || limit > 100000) {
+      return reply.code(400).send({ error: 'limit must be 1..100000' });
+    }
+    try {
+      const result = backfillClassifyPendingEmails(app.db, { dismiss_threshold: threshold, status, limit });
+      // Audit the admin invocation too (the per-row dismisses each get their
+      // own audit_log row inside the function).
+      app.db.prepare(
+        "INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'pending_email.backfill_classify.run', NULL, ?)"
+      ).run(JSON.stringify({ threshold, status, limit, examined: result.examined, classified: result.classified, dismissed: result.dismissed }));
+      return { ok: true, ...result };
+    } catch (err) {
+      return reply.code(500).send({ error: err.message });
     }
   });
 }

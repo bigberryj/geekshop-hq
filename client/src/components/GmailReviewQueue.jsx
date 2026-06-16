@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { fetchJson, postJson } from '../lib/api.js';
 import { Mail, RefreshCw, Inbox as InboxIcon, Loader2, Star, X, RotateCcw } from 'lucide-react';
 import ContactEnrichmentModal from './ContactEnrichmentModal.jsx';
@@ -41,6 +41,7 @@ const FILTER_PRESETS = [
 
 const STORAGE_KEY = 'ghq.inbox.scanPrefs.v1';
 const FILTER_STORAGE_KEY = 'ghq.inbox.filterPrefs.v1';
+const AGENT_HIDE_STORAGE_KEY = 'ghq.inbox.hideAgentMail.v1';
 
 function loadPrefs() {
   try {
@@ -68,6 +69,21 @@ function saveFilterPrefs(p) {
   try { localStorage.setItem(FILTER_STORAGE_KEY, JSON.stringify(p)); } catch (e) { /* ignore */ }
 }
 
+function loadAgentHide() {
+  try { return localStorage.getItem(AGENT_HIDE_STORAGE_KEY) === 'true'; } catch (e) { return false; }
+}
+function saveAgentHide(v) {
+  try { localStorage.setItem(AGENT_HIDE_STORAGE_KEY, v ? 'true' : 'false'); } catch (e) { /* ignore */ }
+}
+
+function parseAgentMailboxList(value) {
+  if (!value) return [];
+  return String(value)
+    .split(/[,\n]/)
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+
 function isoForHoursAgo(hours) {
   return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
 }
@@ -91,6 +107,12 @@ export default function GmailReviewQueue({ onImported }) {
   // both pending and dismissed rows; the list shows both with a status
   // badge and a Restore button on dismissed ones.
   const [showDismissed, setShowDismissed] = useState(false);
+  // Hide operational agent mail (default: johnn5wizbot@gmail.com — set
+  // via /api/settings/agent_mailbox_from). The toggle is client-side
+  // because the server's job is to keep the data, not to second-guess
+  // the admin's view preferences.
+  const [hideAgentMail, setHideAgentMail] = useState(loadAgentHide);
+  const [agentMailboxes, setAgentMailboxes] = useState([]);
 
   const initial = loadPrefs();
   const [range, setRange] = useState(initial.range);
@@ -105,6 +127,36 @@ export default function GmailReviewQueue({ onImported }) {
 
   useEffect(() => { savePrefs({ range, customSince, customUntil, includeStarred }); }, [range, customSince, customUntil, includeStarred]);
   useEffect(() => { saveFilterPrefs({ range: filterRange, customSince: filterCustomSince, customUntil: filterCustomUntil }); }, [filterRange, filterCustomSince, filterCustomUntil]);
+  useEffect(() => { saveAgentHide(hideAgentMail); }, [hideAgentMail]);
+  // When the agent-mail filter is turned on, drop any selected ids
+  // that match the agent mailbox so the bulk-dismiss button doesn't
+  // accidentally dismiss hidden rows.
+  useEffect(() => {
+    if (!hideAgentMail || agentMailboxes.length === 0) return;
+    const set = new Set(agentMailboxes);
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      let changed = false;
+      const next = new Set();
+      for (const id of prev) {
+        const row = (pending || []).find((p) => p.id === id);
+        if (row && row.from_email && set.has(row.from_email.toLowerCase())) {
+          changed = true;
+          continue; // drop agent mail from selection
+        }
+        next.add(id);
+      }
+      return changed ? next : prev;
+    });
+  }, [hideAgentMail, agentMailboxes, pending]);
+
+  // Pull the moderation settings once on mount so the agent-mailbox
+  // list is known client-side for the hide filter.
+  useEffect(() => {
+    fetchJson('/inbox/moderation-settings')
+      .then((s) => setAgentMailboxes(parseAgentMailboxList(s && s.agent_mailbox_from)))
+      .catch(() => { /* leave the list empty — hide toggle becomes a no-op */ });
+  }, []);
 
   const buildFilterParams = useCallback(() => {
     const params = new URLSearchParams();
@@ -144,6 +196,25 @@ export default function GmailReviewQueue({ onImported }) {
     }
   }, [buildFilterParams]);
 
+  // Client-side filter: drop rows whose from_email is in the agent
+  // mailbox list when "Hide agent mail" is on. We filter the in-memory
+  // list (rather than asking the server) so the toggle is instant and
+  // doesn't affect the server's data model.
+  const visiblePending = useMemo(() => {
+    if (!Array.isArray(pending)) return pending;
+    if (!hideAgentMail || agentMailboxes.length === 0) return pending;
+    const set = new Set(agentMailboxes);
+    return pending.filter((p) => !(p.from_email && set.has(p.from_email.toLowerCase())));
+  }, [pending, hideAgentMail, agentMailboxes]);
+
+  // The total counts ALL rows (including hidden agent mail) so the
+  // header doesn't lie about the queue size.
+  const visibleTotal = useMemo(() => {
+    if (!Array.isArray(pending)) return total;
+    if (!hideAgentMail || agentMailboxes.length === 0) return total;
+    return total - (pending.length - visiblePending.length);
+  }, [pending, visiblePending, hideAgentMail, agentMailboxes, total]);
+
   useEffect(() => { load(); }, [load]);
 
   const buildScanBody = () => {
@@ -156,6 +227,27 @@ export default function GmailReviewQueue({ onImported }) {
       if (preset && preset.hours) body.since = isoForHoursAgo(preset.hours);
     }
     return body;
+  };
+
+  // Backfill classification on legacy pending rows. One-shot admin
+  // action. Surfaces the result as a banner so Byron can audit.
+  const [backfillBusy, setBackfillBusy] = useState(false);
+  const [backfillResult, setBackfillResult] = useState(null);
+  const backfill = async (threshold = 0.8) => {
+    setBackfillBusy(true);
+    setError('');
+    try {
+      const r = await postJson('/inbox/pending/backfill-classify', { threshold, status: 'pending', limit: 1000 });
+      if (r.error) setError(r.error);
+      else {
+        setBackfillResult(r);
+        await load();
+      }
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setBackfillBusy(false);
+    }
   };
 
   const scan = async () => {
@@ -176,6 +268,8 @@ export default function GmailReviewQueue({ onImported }) {
       setScanning(false);
     }
   };
+
+
 
   const importOne = async (id) => {
     setBusyId(id);
@@ -261,10 +355,10 @@ export default function GmailReviewQueue({ onImported }) {
     return next;
   });
   const toggleSelectAll = () => {
-    if (!pending) return;
-    const pendingOnly = pending.filter((p) => p.status === 'pending');
-    const allSelected = pendingOnly.every((p) => selectedIds.has(p.id));
-    if (allSelected && pendingOnly.length > 0) {
+    if (!visiblePending) return;
+    const pendingOnly = visiblePending.filter((p) => p.status === 'pending');
+    const allSelected = pendingOnly.length > 0 && pendingOnly.every((p) => selectedIds.has(p.id));
+    if (allSelected) {
       setSelectedIds(new Set());
     } else {
       setSelectedIds(new Set(pendingOnly.map((p) => p.id)));
@@ -276,7 +370,7 @@ export default function GmailReviewQueue({ onImported }) {
       <div className="flex items-center justify-between gap-3 mb-3">
         <h3 className="font-semibold flex items-center gap-2">
           <Mail size={16} /> Gmail review queue
-          {pending && <span className="text-xs text-slate-500 font-normal">({pending.length}{total > pending.length ? ` of ${total}` : ''} pending)</span>}
+          {visiblePending && <span className="text-xs text-slate-500 font-normal">({visiblePending.length}{visibleTotal > visiblePending.length ? ` of ${visibleTotal}` : ''} pending{pending && visiblePending.length < pending.length ? ` (${pending.length - visiblePending.length} agent mail hidden)` : ''})</span>}
         </h3>
         <div className="flex items-center gap-2">
           {/* "Show dismissed" toggle — when on, both pending and dismissed
@@ -289,6 +383,29 @@ export default function GmailReviewQueue({ onImported }) {
             />
             <span className="text-slate-600">Show dismissed</span>
           </label>
+          {/* "Hide agent mail" — keeps operational agent mail in the DB
+              but filters it out of the human-pending view. */}
+          <label className="flex items-center gap-1 text-xs cursor-pointer" data-testid="hide-agent-mail-toggle" title="Hide mail from the agent mailbox(es) configured in Settings">
+            <input
+              type="checkbox"
+              checked={hideAgentMail}
+              onChange={(e) => setHideAgentMail(e.target.checked)}
+            />
+            <span className="text-slate-600">Hide agent mail</span>
+          </label>
+          {/* Backfill-classify button: run the rules-first classifier
+              on any legacy pending rows that don't have a classification
+              yet. Safe to re-run; idempotent. */}
+          <button
+            className="btn-ghost text-xs flex items-center gap-1"
+            onClick={() => backfill(0.8)}
+            disabled={backfillBusy}
+            data-testid="backfill-classify-btn"
+            title="Score and dismiss any un-classified pending rows using the current rules (one-shot, idempotent)"
+          >
+            {backfillBusy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+            {backfillBusy ? 'Backfilling…' : 'Classify legacy'}
+          </button>
           {selectedIds.size > 0 && (
             <button
               className="btn-secondary text-xs flex items-center gap-1"
@@ -352,6 +469,24 @@ export default function GmailReviewQueue({ onImported }) {
         </div>
       )}
 
+      {backfillResult && (
+        <div className="text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded p-2 mb-2" data-testid="backfill-result">
+          Backfill (threshold {backfillResult.threshold}): examined {backfillResult.examined}, classified {backfillResult.classified}, auto-dismissed {backfillResult.dismissed}.
+          {backfillResult.samples && backfillResult.samples.length > 0 && backfillResult.dismissed > 0 && (
+            <details className="mt-1">
+              <summary className="cursor-pointer">Show {Math.min(backfillResult.samples.length, 25)} dismissed examples</summary>
+              <ul className="mt-1 space-y-0.5 text-[11px]">
+                {backfillResult.samples.filter((s) => s.should_dismiss).slice(0, 25).map((s) => (
+                  <li key={s.id}>
+                    <span className="font-mono">id {s.id}</span> · score {Number(s.score).toFixed(2)} · <span className="font-mono">{(s.from_email || '').slice(0, 40)}</span> · {(s.subject || '').slice(0, 50)}
+                  </li>
+                ))}
+              </ul>
+            </details>
+          )}
+        </div>
+      )}
+
       {error && <div className="rounded bg-red-50 border border-red-200 text-red-700 text-xs p-2 mb-2">{error}</div>}
 
       <div className="flex flex-wrap items-center gap-2 mb-3 text-xs" data-testid="display-filter">
@@ -380,15 +515,15 @@ export default function GmailReviewQueue({ onImported }) {
         )}
       </div>
 
-      {pending == null ? (
+      {visiblePending == null ? (
         <p className="text-sm text-slate-500">Loading…</p>
-      ) : pending.length === 0 ? (
+      ) : visiblePending.length === 0 ? (
         <div className="text-sm text-slate-500 flex items-center gap-2">
           <InboxIcon size={14} /> No new emails to review. Hit &quot;Scan Gmail now&quot; to fetch.
         </div>
       ) : (
         <ul className="space-y-2">
-          {pending.map((p) => (
+          {visiblePending.map((p) => (
             <li key={p.id} className={`border rounded p-3 ${p.status === 'dismissed' ? 'border-slate-200 bg-slate-50 opacity-80' : 'border-slate-200 bg-white'}`}>
               <div className="flex items-start justify-between gap-3">
                 <div className="min-w-0 flex-1">
