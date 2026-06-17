@@ -11,6 +11,7 @@ import Time from './pages/Time.jsx';
 import Memory from './pages/Memory.jsx';
 import Settings from './pages/Settings.jsx';
 import PublicBooking from './pages/PublicBooking.jsx';
+import MissionControl from './pages/MissionControl.jsx';
 
 export default function App() {
   return (
@@ -27,6 +28,7 @@ export default function App() {
         <Route path="time" element={<Time />} />
         <Route path="memory" element={<Memory />} />
         <Route path="settings" element={<Settings />} />
+        <Route path="mission-control" element={<MissionControl />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

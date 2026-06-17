@@ -13,6 +13,7 @@ import { readFileSync, existsSync } from 'node:fs';
 import { aiCall } from '../lib/ai.js';
 import { summarizeCronJobs } from '../lib/cron-status.js';
 import { readJsonSafe, readJsonlTail } from '../lib/appointment-email-state.js';
+import { summarizeTasks } from '../lib/agent-tasks.js';
 
 const HERMES_HOME = process.env.HERMES_HOME || '/home/byron/.hermes';
 
@@ -107,6 +108,7 @@ export async function dashboardRoutes(app) {
       top_customers: healthScores,
       cron_status: readCronStatus(),
       monitor_status: readMonitorStatus(),
+      agent_tasks: summarizeTasks(db),
       generated_at: new Date().toISOString(),
     };
   });

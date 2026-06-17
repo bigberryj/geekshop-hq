@@ -168,6 +168,84 @@ No cron prompts, scripts, or secrets are exposed.
 - Appended to every outbound ticket reply (both `email-reply` and `resolve-with-reply`).
 - Plain text only by design — see `docs/security.md` for the rationale.
 
+## Mission Control (agent task queue)
+
+A durable queue of tasks Byron asks J5 to do. Surfaces in the HQ UI at
+`/mission-control` with live polling, a drawer showing the original ask
++ worker's self-review, and Approve / Send-back / Cancel buttons.
+
+### Endpoints
+
+- `GET    /api/agent-tasks?status=all|open|review|blocked|running|queued|failed|done|cancelled&limit=100&offset=0`
+  - List tasks, paged. `open` = `queued|running|review|blocked` (everything that needs eyes).
+  - Response: `{ items, total, limit, offset }`. Items do **not** include `prompt` (use `GET /:id` for that).
+- `GET    /api/agent-tasks/summary`
+  - Cheap counts per status for the dashboard widget. `{ queued, running, review, blocked, failed, done, cancelled, total }`.
+- `POST   /api/agent-tasks`
+  - Body: `{ title, prompt, source?, source_ref?, priority?, max_attempts?, acceptance_criteria? }`
+  - `source` ∈ `hq_ui` (default) | `telegram` | `email` | `voice` | `seed`.
+  - `prompt` capped at 32 KiB; `title` at 240 chars. Exceeding returns 400.
+  - `acceptance_criteria`: array of `{ req, kind? }`. Empty / missing → worker infers 2–5 criteria.
+  - Returns 201 with the new task (full detail including `prompt`).
+- `GET    /api/agent-tasks/:id`
+  - Full task including `prompt`, `acceptance_criteria`, `review_checklist`. 404 if missing.
+- `POST   /api/agent-tasks/:id/decision`
+  - Body: `{ action: 'approve' | 'requeue' | 'cancel', note? }`.
+  - Allowed only when the task is in `review` or `blocked`. Terminal tasks (`done` / `cancelled`) and pre-worker tasks (`queued` / `running`) return 409.
+  - The worker's `running → review` transition leaves `decision = null`; `approve` here sets `decision = 'approve'` and `decided_by = 'byron'`.
+- `POST   /api/agent-tasks/:id/requeue`
+  - Body: `{ note? }`. Alias for `decision` with `action: 'requeue'`. Same state guard.
+- `POST   /api/agent-tasks/callback`
+  - Lightweight shape designed for Telegram inline-button callbacks (and any other push-style client where JSON bodies are awkward).
+  - Query params: `action`, `id`, `token` (the task's `uid` for sanity). Body fields are accepted as a fallback for clients that prefer JSON.
+  - Returns the updated task on success, 409 on transition conflict, 400 on bad token / unknown action, 404 on missing task.
+
+### Worker contract
+
+The worker cron (`GeekShop agent task worker`, every 2 min) reads its operating
+manual at `server/scripts/agent-task-worker/WORKER_PROMPT.md` and uses
+`server/scripts/agent-task-worker/agent-task-cli.js` to talk to the table:
+
+```
+node server/scripts/agent-task-worker/agent-task-cli.js claim
+node server/scripts/agent-task-worker/agent-task-cli.js heartbeat <id>
+node server/scripts/agent-task-worker/agent-task-cli.js mark-review <id> --summary="..." --checklist='[...]' --evidence=...
+node server/scripts/agent-task-worker/agent-task-cli.js mark-blocked <id> --summary="..." --checklist='[...]' --error="..."
+node server/scripts/agent-task-worker/agent-task-cli.js mark-failed <id> --summary="..." --error="..."
+node server/scripts/agent-task-worker/agent-task-cli.js stuck-requeue --ms=600000
+```
+
+The CLI prints `NO_TASK` (single line) when the queue is empty. When a
+task is claimed, it prints the full task JSON on stdout. Heartbeat
+re-issues are how the worker keeps the stuck-detector from bouncing a
+slow but live task.
+
+### Status flow
+
+```
+  queued  ──┐
+            ▼
+         running ─── heartbeat ──→  running
+            │
+            ├── all pass  → review    (Byron approves → done, or sends back → queued, or cancels)
+            ├── some fail → blocked   (Byron approves → done, or sends back → queued, or cancels)
+            └── crash     → failed    (terminal, no further decision)
+```
+
+`done` and `cancelled` are terminal. `failed` is also terminal but a
+requeue is possible by manual SQL or a future "rescue" endpoint — not
+exposed in the v1 UI by design (failed tasks are usually worth a
+human-in-the-loop look at the cause before retrying).
+
+### Self-review gate
+
+Before the worker transitions to `review`, it must build a
+`review_checklist` (JSON array of `{ req, pass, note }`) covering every
+acceptance criterion. If **any** `pass: false` exists, the task goes to
+`blocked`, not `review`. This is the only thing standing between
+"ran without errors" and "actually did what was asked" — Byron's eyes
+on the checklist in the Mission Control drawer are the final word.
+
 ## AI
 
 - MiniMax M3 is the primary configured provider for current local development.

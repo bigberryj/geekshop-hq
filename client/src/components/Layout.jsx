@@ -1,5 +1,5 @@
 import { NavLink, Outlet } from 'react-router-dom';
-import { Inbox, Ticket, Calendar, Users, DollarSign, Clock, Search, Settings } from 'lucide-react';
+import { Inbox, Ticket, Calendar, Users, DollarSign, Clock, Search, Settings, Bot } from 'lucide-react';
 
 const nav = [
   { to: '/', label: 'Inbox', icon: Inbox, end: true },
@@ -9,6 +9,7 @@ const nav = [
   { to: '/money', label: 'Money', icon: DollarSign },
   { to: '/time', label: 'Time', icon: Clock },
   { to: '/memory', label: 'Memory', icon: Search },
+  { to: '/mission-control', label: 'Mission Control', icon: Bot },
   { to: '/settings', label: 'Settings', icon: Settings },
 ];
 

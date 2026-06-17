@@ -6,8 +6,13 @@ Built as a deliberate rebuild of the previous `GeekTicket` (a.k.a. `tasktrackert
 
 ## What you get
 
-- **9 pages**: Inbox, Tickets, Appointments, Customers, Money, Time, Memory search, Settings, Public Booking
-- **11 DB tables** (SQLite, single file at `data/hq.db`)
+- **10 pages**: Inbox, Tickets, Appointments, Customers, Money, Time, Memory search, Settings, Public Booking, **Mission Control**
+- **12 DB tables** (SQLite, single file at `data/hq.db`)
+- **Mission Control** — durable task queue with a worker cron, self-review
+  gate, and a real-time UI at `/mission-control`. Byron enqueues a task in
+  the UI, in Telegram (`queue <description>`), or via the API; the worker
+  picks it up every 2 min, runs it, self-reviews against acceptance
+  criteria, and pings for approval.
 - **~38 API endpoints**
 - **2 AI features** powered by MiniMax M3 locally, with OpenAI optional if an `OPENAI_API_KEY` is provided
 - **Self-hosted customer memory** — preferences, equipment, history, relationships, notes per customer
@@ -17,6 +22,17 @@ Built as a deliberate rebuild of the previous `GeekTicket` (a.k.a. `tasktrackert
 - **Public booking page** at `/book/<slug>` with visible 90-minute available slots
 - **Printable invoices** via browser Print / Save PDF
 - **Automation status widgets** for appointment monitoring, starred-email suggestions, and Hermes cron health
+- **Mission Control** — durable task queue, self-reviewing worker, real-time UI. See `docs/api.md#mission-control-agent-task-queue` and `docs/architecture.md#mission-control--worker--review`.
+
+## Mission Control in 30 seconds
+
+1. Open http://localhost:5173/mission-control
+2. Click **+ New task**, give it a title, full prompt (acceptance criteria are auto-inferred if you don't supply any), and submit.
+3. The worker cron picks it up on the next 2-min tick. You can force it with `hermes cron run e6034f45874f`.
+4. The worker writes a `result_summary` and a self-review checklist. You see the row go `queued → running → review` in real time. A Telegram ping lands in `@john5wizbot` with the checklist.
+5. Click the row in HQ to **Approve**, **Send back**, or **Cancel**.
+
+Telegram shortcut: in the bot chat, type `queue <description>` and the session enqueues it for you.
 
 ## Quick start (dev)
 

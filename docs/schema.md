@@ -14,6 +14,7 @@ erDiagram
   pending_emails ||--o| tickets : imports_to
   invoices ||--o{ time_entries : marks_invoiced
   settings ||--|| settings : key_value
+  agent_tasks ||--o{ agent_tasks : requeues
 ```
 
 ## `customers`
@@ -177,6 +178,57 @@ Notes:
 
 - `body_html` is sanitized on write (`sanitizeEmailHtml` in `lib/attachments.js`): strips `<script>`, `<iframe>`, `<object>`, `<embed>`, `<link>`, `on*` handlers, `javascript:` URLs. Renders inside a sandboxed iframe in the UI.
 - The reply matcher (`lib/replies.js`) appends new customer messages here when a Gmail message is recognized as a reply to an existing open ticket. The poller and the manual Import button both go through this path.
+
+## `agent_tasks`
+
+Mission Control — durable queue of tasks Byron asks J5 to do. Driven by
+the HQ UI (`POST /api/agent-tasks`), the Telegram bridge, and (future)
+email. A cron worker (`GeekShop agent task worker`, every 2 min) claims
+the next task, runs it through a subagent, self-reviews against
+acceptance criteria, and transitions to `review` (all criteria pass) or
+`blocked` (some criterion failed). Byron then approves / sends back /
+cancels from the Mission Control page or (future) inline Telegram
+buttons.
+
+| Column | Type | Null | Default | Notes |
+|---|---|---:|---|---|
+| id | INTEGER | NO | AUTOINCREMENT | PK |
+| uid | TEXT | NO | — | Short stable handle, e.g. `T-AB12CD`. Exposed in the UI and used as the inline-button token. |
+| title | TEXT | NO | — | One-line summary shown in the HQ table |
+| prompt | TEXT | NO | — | Full ask; the worker session is fresh and gets no other context |
+| source | TEXT | NO | `hq_ui` | `hq_ui` \| `telegram` \| `email` \| `voice` \| `seed` |
+| source_ref | TEXT | YES | — | Telegram msg id, Gmail id, etc. |
+| priority | INTEGER | NO | 0 | Higher = picked first |
+| status | TEXT | NO | `queued` | `queued` \| `running` \| `review` \| `blocked` \| `failed` \| `done` \| `cancelled` |
+| attempts | INTEGER | NO | 0 | Incremented atomically on each claim |
+| max_attempts | INTEGER | NO | 3 | After this many failed runs, the worker transitions the task to `failed` instead of requeueing |
+| created_at | TEXT | NO | CURRENT_TIMESTAMP | |
+| started_at | TEXT | YES | — | Set on first claim |
+| last_heartbeat_at | TEXT | YES | — | Worker writes periodically while running; stuck-detector requeues tasks with stale heartbeats |
+| finished_at | TEXT | YES | — | Set on terminal transition |
+| last_error | TEXT | YES | — | Exception message on `failed` / `blocked` |
+| result_summary | TEXT | YES | — | 1–3 sentence outcome the worker writes before finishing |
+| evidence_path | TEXT | YES | — | Filesystem path to evidence (file, screenshot, log) |
+| worker_run_id | TEXT | YES | — | Hermes run id that handled it (for audit) |
+| acceptance_criteria | TEXT | YES | — | JSON: `[{ req, kind }]` — Byron-supplied contract |
+| review_checklist | TEXT | YES | — | JSON: `[{ req, pass, note }]` — the worker's self-review |
+| decision | TEXT | YES | — | `approve` \| `requeue` \| `cancel` |
+| decided_by | TEXT | YES | — | `byron` (UI button) or `auto` (worker self-rejected) |
+| decision_note | TEXT | YES | — | Free text from the human or auto note |
+| decided_at | TEXT | YES | — | |
+
+Indexes:
+
+- `idx_agent_tasks_status_priority` `(status, priority DESC, created_at ASC)` partial — covers the worker's hot claim path
+- `idx_agent_tasks_running` `(status, last_heartbeat_at)` partial — covers the stuck-detector
+- `idx_agent_tasks_created_desc` `(created_at DESC, id DESC)` — HQ default sort
+- `idx_agent_tasks_status_created` `(status, created_at DESC)` — history view
+
+Notes:
+
+- Status transitions are state-machine-guarded in `lib/agent-tasks.js::decideTask` — a `done` task can't be re-decided, a `queued` task can't be approved before the worker has run.
+- The "open" list filter is `queued|running|review|blocked` — everything that needs eyes.
+- The worker prompt is at `server/scripts/agent-task-worker/WORKER_PROMPT.md`; it's the operating manual the worker reads on every cron tick.
 
 ## Tax models
 

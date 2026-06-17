@@ -1,5 +1,47 @@
 # Changelog
 
+## 2026-06-17 — Mission Control: durable task queue + worker + UI
+
+The "I asked J5 to do something and need to know if it's actually done" loop, end-to-end. Durable queue, self-reviewing worker cron, real-time HQ page, Telegram bridge.
+
+### What's new
+
+- **`agent_tasks` table** (migration `029_agent_tasks.sql`): durable queue with a state-machine (`queued → running → review | blocked | failed → done | cancelled | requeued`), per-row heartbeat for stuck detection, attempt counter, and a self-review checklist stored alongside the result.
+- **REST API** (`/api/agent-tasks`):
+  - `GET /api/agent-tasks?status=…` list, `GET /api/agent-tasks/summary` for the dashboard widget.
+  - `POST /api/agent-tasks` enqueue. `title` capped at 240 chars, `prompt` at 32 KiB. `acceptance_criteria` accepted as `[{ req, kind }]`.
+  - `GET /api/agent-tasks/:id` full task incl. `prompt` and `review_checklist`.
+  - `POST /api/agent-tasks/:id/decision` with `action: approve | requeue | cancel` and an optional `note`. State-guarded: 409 on transition conflict.
+  - `POST /api/agent-tasks/callback` (token-in-query) for future Telegram inline-button support.
+  - Dashboard endpoint now includes `agent_tasks: { queued, running, review, blocked, failed, done, cancelled, total }` for the widget.
+- **Mission Control UI** (`/mission-control`): live-polling table (5s) with summary cards, status filter pills, and a side drawer showing the original ask, worker's `result_summary`, self-review checklist (✓/✗ icons), timestamps, and Approve / Send-back / Cancel buttons. New entry in the sidebar nav (Bot icon).
+- **Worker CLI** (`server/scripts/agent-task-worker/agent-task-cli.js`): atomic `claim`, `heartbeat`, `finish` / `mark-review` / `mark-blocked` / `mark-failed`, `stuck-requeue`. The CLI prints `NO_TASK` when the queue is empty so the worker prompt can short-circuit cleanly.
+- **Enqueue CLI** (`server/scripts/agent-task-worker/enqueue-task.js`): one-liner to enqueue from the terminal (stdin or argv) with `source` / `priority` / `source_ref` flags. Used by the session-level Telegram bridge.
+- **Worker cron** (`GeekShop agent task worker`, every 2 min, deliver to Telegram): reads the operating manual at `server/scripts/agent-task-worker/WORKER_PROMPT.md` on every tick, runs the stuck-requeue sweep, claims the next task, does the work, self-reviews, transitions to `review` or `blocked`, and pings Byron on Telegram with a `[J5][agent-task] <uid> → <status>` summary + checklist.
+- **Telegram → queue bridge** (v1, session-level): typing `queue <description>` in the `@john5wizbot` chat enqueues a task. (Telegram-bus polling not wired in v1 — that needs a gateway hook; the session-level path gives the same UX with no gateway modification.)
+- **19 new unit tests** for `lib/agent-tasks.js` (claim atomicity, heartbeat, finish state-guards, decide state-machine, stuck-requeue with max-attempts, list ordering, summary counts). All 185/185 tests pass.
+- **Docs:** `docs/schema.md` (table + ER diagram), `docs/api.md` (full endpoint reference), `docs/architecture.md` (data flow + Telegram bridge), `docs/security.md` (blast radius, what the worker cannot do, input validation, stuck-task requeue, dashboard projection).
+
+### Security notes
+
+- The worker can run any tool the Hermes agent has, but cannot enqueue new tasks, cannot decide tasks, and cannot run other crons. The worker CLI deliberately doesn't expose `create` / `enqueue` / `approve` / `cancel`.
+- Inbound tasks come from Byron-owned paths only (HQ UI, Telegram chat, terminal). No email-bus auto-ingest in v1.
+- Every decision is on the row with `decided_by` and a `decision_note` for audit.
+- API auth posture unchanged: loopback / LAN / Tailscale, same as every other HQ endpoint.
+
+### Verified
+
+- Full E2E cycle: enqueue → claim → heartbeat → do work → mark-review with real checklist → state transitions → Telegram notification path.
+- Browser-tested: Mission Control page renders summary cards, status pills, table with live duration / age / attempts. Drawer shows original ask, worker summary, self-review with green check / red X, decision buttons. Approve action takes review → done with note recorded.
+- Callback endpoint: valid token → 200, bad token → 400, bad action → 400, transition conflict → 409.
+- Migration applies clean on boot against the existing `hq.db`; older tests still 185/185 green.
+
+### Known limitations / parked for v2
+
+- **Inline Telegram buttons** for Approve / Send-back / Cancel need a small gateway patch — the `send_message` tool doesn't currently expose `reply_markup`. Callback endpoint is in place and waiting.
+- **Gmail → task ingest** is not wired (intentional; would let an untrusted sender enqueue). Easy follow-up if you want it.
+- **Worker cron currently rate-limited (HTTP 429)** by the same provider throttle affecting the other two HQ-area crons. When the limit clears, the worker will start picking up tasks automatically.
+
 ## 2026-06-17 — Gmail reply sync, inline graphics, outbound signature, 30-min poll
 
 ### Reply sync (customer replies land on the right ticket)

@@ -72,3 +72,34 @@ This is intentional. Even though the signature is admin-authored, allowing HTML 
 The reply matcher (`lib/replies.js`) only matches open tickets for the **same customer** (matched by email). It does not move a message from one customer's ticket to another customer's ticket, even if subject lines collide. Matchers that conflate across customers would be a privacy / impersonation hazard; the current implementation prevents that.
 
 The "mark read" call (`markImportedRead` → `imapflow` `\Seen`) is best-effort and never throws. It runs after a successful import (new or merged) so the Gmail inbox stays in sync with the dashboard. It does **not** archive, so the message remains in the customer's Gmail thread for their reference.
+
+## Mission Control (agent task queue)
+
+### Blast radius
+
+The worker cron runs with the full Hermes agent toolset (terminal, file, browser, delegate_task, network). A task prompt that says "wipe X" or "deploy to prod without asking" can be acted on if it's literal. The safety boundary is:
+
+1. **Byron-authorized source.** Tasks enter the queue through paths Byron owns: the HQ UI (he typed it), the Telegram chat (he said it), or the enqueue CLI (he ran it). The "agent_mailbox_from"-style auto-ingest from email is **not** wired in v1 — that would let an untrusted sender enqueue a task.
+2. **Acceptance criteria are the contract.** The worker self-reviews against the criteria; if a criterion fails, the task goes to `blocked`, not `review`. Byron decides in the UI.
+3. **Decision is recorded.** Every approve / requeue / cancel is on the row with `decided_by` and a `decision_note`. A task that ran but wasn't approved is visible in the history.
+4. **Source-level authentication, not per-row.** The API doesn't auth individual tasks; it relies on the same network posture as the rest of HQ (loopback / LAN / Tailscale, UFW-restricted). This matches how every other HQ endpoint works.
+
+### Input validation
+
+- `prompt` is capped at 32 KiB and `title` at 240 chars. The DB won't accept more (the route returns 400 first).
+- `source` is enum-checked server-side. `priority` and `max_attempts` are coerced to integers.
+- `acceptance_criteria` items are sanitized to `{ req: string, kind?: string }`.
+
+### What the worker cannot do
+
+- It cannot enqueue new tasks. (The CLI exposes `claim` / `finish` / `heartbeat` / `stuck-requeue` — no `create` / `enqueue`.) A task that wants to spawn subtasks must come back to Byron for a new task.
+- It cannot decide tasks. (No `approve` / `cancel` in the worker CLI; those are HQ-UI-only.) This prevents a worker from approving its own work and silently marking it done.
+- It cannot run other cron jobs or modify cron state. The worker prompt explicitly forbids this and the prompt is the boundary.
+
+### Stuck-task requeue
+
+Tasks with no heartbeat for 10 minutes are requeued (or failed if they've hit `max_attempts`). This catches both "worker crashed" and "worker's process was killed mid-task." A requeued task has its `last_error` annotated with the stale timestamp; the next claim increments `attempts`.
+
+### Dashboard projection
+
+The dashboard's `agent_tasks` summary is just counts. No prompt bodies, no PII, no source_ref values. The same safe-projection discipline as the existing `cron_status` and `monitor_status` fields.
