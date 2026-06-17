@@ -16,6 +16,7 @@
 **Solutions & learnings:**
 - `docs/solutions/build-it/built-geekshop-hq.md` — full build record, evidence, pivots
 - `docs/solutions/build-it/built-geekshop-hq-v0.1.0.md` — original v0.1.0 solution doc (kept for history)
+- `docs/solutions/build-it/geekshop-hq-import-merge-and-signature-iteration.md` — 2026-06-17 reply-merge + signature + inline graphics build
 
 **Conventions:**
 - Schema migrations are in `server/db/migrations/` as numbered `.sql` files; applied by `server/db/migrate.js`

@@ -39,7 +39,12 @@ beforeEach(() => {
 describe('scanPendingEmails passes options through to fetchUnread', () => {
   it('forwards a default 24-hour since window when none is given', async () => {
     const before = Date.now();
-    await scanPendingEmails(db, {});
+    // autoDismissJunk:false stops the live LLM classifier from running —
+    // these tests only assert that scan forwards its options to the
+    // IMAP layer. Junk-classifier behaviour is covered by
+    // junk-classifier.test.js. Without this flag, the test hangs
+    // 5s awaiting the LLM and times out.
+    await scanPendingEmails(db, { autoDismissJunk: false });
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     const opts = fetchSpy.mock.calls[0][0] || {};
     expect(opts.since).toBeInstanceOf(Date);
@@ -53,28 +58,28 @@ describe('scanPendingEmails passes options through to fetchUnread', () => {
 
   it('accepts an explicit since as Date', async () => {
     const since = new Date('2026-06-01T00:00:00Z');
-    await scanPendingEmails(db, { since });
+    await scanPendingEmails(db, { since, autoDismissJunk: false });
     expect(fetchSpy.mock.calls[0][0].since).toBe(since);
   });
 
   it('accepts an explicit until as Date', async () => {
     const until = new Date('2026-06-15T23:59:59Z');
-    await scanPendingEmails(db, { until });
+    await scanPendingEmails(db, { until, autoDismissJunk: false });
     expect(fetchSpy.mock.calls[0][0].until).toBe(until);
   });
 
   it('lets the caller turn off starred inclusion', async () => {
-    await scanPendingEmails(db, { includeStarred: false });
+    await scanPendingEmails(db, { includeStarred: false, autoDismissJunk: false });
     expect(fetchSpy.mock.calls[0][0].includeStarred).toBe(false);
   });
 
   it('forwards limit', async () => {
-    await scanPendingEmails(db, { limit: 75 });
+    await scanPendingEmails(db, { limit: 75, autoDismissJunk: false });
     expect(fetchSpy.mock.calls[0][0].limit).toBe(75);
   });
 
   it('preserves the 100-cap to avoid hammering Gmail', async () => {
-    await scanPendingEmails(db, { limit: 9999 });
+    await scanPendingEmails(db, { limit: 9999, autoDismissJunk: false });
     expect(fetchSpy.mock.calls[0][0].limit).toBeLessThanOrEqual(100);
   });
 });
@@ -82,7 +87,7 @@ describe('scanPendingEmails passes options through to fetchUnread', () => {
 describe('default scan window is 24h (regression: scan must not be unbounded)', () => {
   it('a caller that omits since/until still gets a bounded window', async () => {
     const before = Date.now();
-    await scanPendingEmails(db, {});
+    await scanPendingEmails(db, { autoDismissJunk: false });
     const opts = fetchSpy.mock.calls[0][0];
     expect(opts.since).toBeInstanceOf(Date);
     // Window must not be in the future

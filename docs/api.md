@@ -37,7 +37,8 @@ No cron prompts, scripts, or secrets are exposed.
 - `POST /inbox/test`
   - Tests Gmail IMAP connection.
 - `GET /inbox/status`
-  - Returns poller configuration.
+  - Returns poller configuration: `{ hasCreds, pollIntervalMin, autoCreate, moderation_mode }`.
+  - `pollIntervalMin` reflects `BYRON_GMAIL_POLL_INTERVAL_MIN` (default 30 min). The poller checks Gmail for new messages on this cadence.
 
 ### Gmail pending queue
 
@@ -54,8 +55,15 @@ No cron prompts, scripts, or secrets are exposed.
   - Applies strict junk classification before insert. Obvious junk is stored as `status='dismissed'` with classification metadata; ambiguous messages remain pending.
 - `POST /inbox/pending/:id/import`
   - Creates/links a customer and creates a request from a pending email.
-  - Returns `{ ticket, customer, contactMatch? }`.
+  - Returns `{ ticket, customer, contactMatch?, merged_into_existing?, already_imported? }`.
   - `contactMatch` is best-effort Google Contacts enrichment data; the frontend must still ask for an explicit Apply click before updating customer fields.
+  - **Reply-merge behaviour (2026-06-17):** before creating a brand-new ticket, the import path runs the reply matcher (`lib/replies.js`). If the Gmail message is recognized as a reply to an existing open ticket for the same customer (matched by `In-Reply-To` / `References` thread id, or by sender + stripped `Re:`/`Fwd:` subject), the message is appended to the existing ticket, the pending row is flipped to `imported`, the Gmail message is marked `\Seen`, and the response carries `merged_into_existing: true` with the existing ticket.
+  - **Idempotency:** if the matcher reports `already_appended` (the message already produced a `ticket_messages` row in a prior run), the pending row is still flipped to `imported` but the response carries `already_imported: true` and **no** new ticket is created.
+  - After a successful import (new or merged), the source Gmail message is marked read via `imapflow` (`\Seen` flag, no archive). Best-effort — never throws.
+- `GET /inbox/pending/:id/preview`
+  - Returns `{ id, message_id, from_name, from_email, subject, date, body_text, body_html, attachments }`.
+  - `body_html` is sanitized (`sanitizeEmailHtml`) and has `cid:` image references rewritten to `/api/attachments/:id/raw`.
+  - On-demand fetches from Gmail if the cached body is empty or whitespace-only.
 - `POST /inbox/pending/:id/dismiss`
   - Marks one pending email dismissed by the user.
 - `POST /inbox/pending/bulk-dismiss`
@@ -80,11 +88,27 @@ No cron prompts, scripts, or secrets are exposed.
 - `POST /tickets/:id/email-reply`
   - Body: `{ body }`
   - Sends a normal customer email with subject `Re: <original subject>` and keeps the request open.
+  - The admin's `email_signature` setting is appended to both the plain-text and HTML body. If the signature is empty, the body is sent as-is.
 - `POST /tickets/:id/resolve-with-reply`
   - Body: `{ reply_body }`
-  - Sends customer email, marks request resolved, and archives Gmail thread when source is email.
+  - Sends customer email (signature appended), marks request resolved, and archives Gmail thread when source is email.
 - `POST /tickets/:id/resolve`
-  - Sends a short no-ticket-wording resolution email and archives Gmail thread when source is email.
+  - Sends a short no-ticket-wording resolution email (signature appended) and archives Gmail thread when source is email.
+
+### Ticket timers
+
+- `GET /tickets/:id/time`
+  - Returns time entries for a ticket, newest first.
+  - Each row includes `status` (`running`, `paused`, `stopped`) and `elapsed_seconds`.
+- `POST /tickets/:id/time/start`
+  - Starts a timer for the ticket. Idempotent for the same ticket: if an active timer already exists, returns it instead of creating a duplicate.
+  - Maintains the single-active-timer model by finalizing active timers on other tickets.
+- `POST /tickets/:id/time/pause`
+  - Freezes the active timer and stores accumulated elapsed time in `duration_seconds`.
+- `POST /tickets/:id/time/resume`
+  - Resumes a paused timer from the accumulated elapsed value.
+- `POST /tickets/:id/time/stop`
+  - Finalizes the active timer, paused or running, and returns the stopped row.
 
 ## Customers
 
@@ -127,6 +151,22 @@ No cron prompts, scripts, or secrets are exposed.
 ## Tax models (`lib/tax.js`)
 
 `none` (0%), `gst` (5% only), `gst_pst_bc` (5+7=12% two-line), `gst_qst_qc` (5+9.975% two-line), `hst_on_13` (13% single line), `hst_nb_ns_pe_15` (15% single line). Default: `gst_pst_bc`.
+
+## Settings
+
+- `GET /settings`
+  - Returns all settings as a flat `{ key: value }` object. Sensitive fields (`smtp_pass`) are masked.
+- `PUT /settings/:key`
+  - Body: `{ value }`.
+  - Upserts a single key/value pair. Used by the Settings page for everything from `business_name` to `email_signature`.
+- `POST /settings/test-ai/:provider`
+  - Probes the named AI provider (`minimax`, `codex`, `gemini`) and returns `{ ok, latency_ms }` or `{ ok: false, error }`.
+
+### Outbound email signature
+
+- Stored as `settings.email_signature` (plain text).
+- Appended to every outbound ticket reply (both `email-reply` and `resolve-with-reply`).
+- Plain text only by design — see `docs/security.md` for the rationale.
 
 ## AI
 

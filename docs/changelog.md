@@ -1,5 +1,89 @@
 # Changelog
 
+## 2026-06-17 — Gmail reply sync, inline graphics, outbound signature, 30-min poll
+
+### Reply sync (customer replies land on the right ticket)
+
+- The reply matcher (`server/lib/replies.js`) is now wired into **both** code paths that turn a Gmail message into a ticket message:
+  - The poller (`server/index.js`): every 30 minutes, new Gmail messages are checked against existing open tickets for the same customer. Matches are appended to the existing ticket and the Gmail message is marked `\Seen`.
+  - The manual **Import** button (`server/lib/pending-emails.js::importPendingEmail`): clicking Import on a Gmail reply that belongs to an existing ticket now appends to the existing ticket instead of creating a duplicate. Returns `merged_into_existing: true` in the response.
+- Matching strategy, in order, first hit wins:
+  1. **Thread match:** the message's `In-Reply-To` / `References` headers (parsed by `mailparser`) match any open ticket's `source_message_id`.
+  2. **Sender + subject match:** the same customer has an open ticket whose subject (with `Re:` / `Fwd:` prefixes stripped) is contained in the new message's stripped subject. Handles `Re: Fwd: Re: Volunteer Cowichan` → `Volunteer Cowichan` correctly.
+- **Idempotency:** `ticket_messages.gmail_message_id` (migration 013) is unique. A re-scan or a re-import of the same Gmail message hits the `already_appended` branch and does **not** create a duplicate message or ticket.
+- **Mark read on import:** every successful import (new ticket OR merged reply) calls `markImportedRead` to set the Gmail `\Seen` flag. The inbox stays in sync with the dashboard. Best-effort; never throws.
+
+### Inline graphics in the ticket conversation
+
+- Imported Gmail HTML is now sanitized and rendered inside a sandboxed iframe in `TicketDetail`. Inline `<img src="cid:…">` references are rewritten to our `/api/attachments/:id/raw` endpoint so inline screenshots render in the conversation, the way they look in Gmail.
+- Sanitizer (`sanitizeEmailHtml` in `server/lib/attachments.js`): strips `<script>`, `<iframe>`, `<object>`, `<embed>`, `<link>`, `<style>`, `on*` handlers, `javascript:` URLs. Renders inside an iframe with `sandbox="allow-same-origin"` and no `allow-scripts` — defense in depth. See `docs/security.md` for the full threat model.
+- New migrations:
+  - `013_ticket_message_gmail_id.sql` — adds `ticket_messages.gmail_message_id` (unique index) for reply-match idempotency.
+  - `014_ticket_message_source_message_id.sql` — adds `ticket_messages.source_message_id` for the `In-Reply-To` / `References` cross-reference.
+
+### Outbound email signature
+
+- New `settings.email_signature` setting (plain text, multi-line). Appended to every outbound ticket reply (`Email customer` and `Reply & resolve`) as both plain-text (`--` separator) and a small styled HTML footer.
+- Settings page → "Outbound email signature" section: textarea with live preview (sample reply + your signature, side-by-side). Saves on blur or button click.
+- Plain text only by design — see `docs/security.md` for the rationale (HTML-escape is simpler and safer than a signature sanitizer).
+
+### 30-minute Gmail poll interval
+
+- `BYRON_GMAIL_POLL_INTERVAL_MIN` bumped from `5` to `30` in `server/.env` and `server/.env.example`. The poller still runs in `pending_queue` mode — no auto-import.
+- 30 minutes is a deliberate trade-off: less IMAP chatter (Gmail rate limits are tighter than they used to be) at the cost of up to 30 min delay before a customer reply shows up in the dashboard. The matcher's idempotency guarantees the merge is correct regardless.
+
+### Test suite
+
+- `166/166 passing in 2.23s` (was `153/154` + a 5s timeout in `inbox-scan.test.js`).
+- New: `server/test/signature.test.js` (8 tests), `server/test/import-merge.test.js` (4 tests).
+- Fix: `server/test/inbox-scan.test.js` was awaiting a real LLM call in a test that only asserts option-forwarding. Passing `autoDismissJunk: false` in the test stops the LLM from being called, the test now finishes in <50ms.
+
+### Other fixes from the same window
+
+- Fixed `inbox-scan.test.js` 5s timeout (LLM-await-in-option-forwarding-test).
+- Fixed missing `source_message_id` column that the reply matcher's `INSERT` was depending on (migration 014). This bug was caught by the merge smoke test before commit.
+
+## 2026-06-16 — Hermes rate-limit queue + email preview fix + tickets filter
+
+### Hermes rate-limit queue (new)
+
+- Created `~/.hermes/queue/` with a JSONL append-only log of parked tasks.
+- `hermes-queue` CLI (`/home/byron/.local/bin/hermes-queue`) with `add`, `list`, `pause`, `resume`, `done`, `fail`, `now`, `tick`.
+- Exponential backoff (1m → 30m cap) with per-provider Retry-After respect.
+- `lib/ai.js` 429 hook: when `aiCall(..., { parkKey })` hits a 429, the call is parked in the queue so a cron tick can resume it when the rate limit lifts.
+- `server/routes/tickets.js` now passes `parkKey: ghq-ai-draft-<ticket_id>` so AI draft 429s survive a session restart.
+- Cron `hermes-queue-tick` runs every 30 min, reports status to Telegram.
+
+### Email preview modal fix (Inbox → Preview)
+
+- **Root cause:** preview route only re-fetched from Gmail when both `body` and `snippet` were empty, but real rows often had a whitespace-only `body` (e.g. PlayStation's envelope-only body), so the modal rendered blank and users thought it was a "not found" error.
+- Added `pending_emails.body_html` + `pending_emails.body_fetched_at` columns (migration 012). The route persists Gmail's HTML on the first on-demand fetch so subsequent previews are instant.
+- `body_text` now falls back to the fresh Gmail body when the stored body is whitespace-only.
+- Plain-text fallback wraps the body in a styled `<pre>` so the iframe still renders cleanly.
+- Replaced three `require()` calls inside ESM routes with proper top-level imports.
+- Added 3 regression tests (`inbox-preview.test.js`).
+
+### Tickets page: default filter to open + pending
+
+- Old behaviour: `?status=` defaulted to "all" (open + pending + resolved), so resolved tickets cluttered the default view.
+- New behaviour: defaults to **open + pending**. Three checkbox toggles (open / pending / resolved) and a "show all" link.
+- Hash-based persistence: `?status=open,resolved` survives a refresh. The default hash is empty (i.e. open + pending).
+- Multi-status API: `GET /api/tickets?status=open,pending` now uses `IN (?, ?)`.
+- 4 new tests in `tickets-filter.test.js`.
+
+### Timer (previous patch, still active)
+
+- Already in `v0.1.0` changelog. Tests 154/154 passing.
+
+## 2026-06-16 — Ticket timer pause/resume fix
+
+- **Fixed the TicketDetail timer button.** Root cause: the React page had `const running = ticket.messages && false`, so the button always acted as "Start timer" and never read the actual timer state.
+- Added backend timer state support: `running`, `paused`, `stopped`, with new `paused_at` column and accumulated `duration_seconds` semantics.
+- Added `POST /api/tickets/:id/time/pause` and `POST /api/tickets/:id/time/resume`; `start` is now idempotent for the same ticket and no longer creates duplicate active rows on repeat clicks.
+- Updated TicketDetail UI to show a live `HH:MM:SS` elapsed timer, `Pause`, `Resume`, and `Stop` controls.
+- Fixed browser elapsed math for SQLite `CURRENT_TIMESTAMP` UTC strings so timers don't sit at `00:00:00` due timezone parsing.
+- Verification: backend tests green at 146/146; client production build green; browser-tested Start → live elapsed → Pause freezes → Resume continues → Stop returns to Start.
+
 ## 2026-06-16 — Gmail junk classifier: backfill, fixes, and settings tuning
 
 - **Fixed `isLikelyHuman` over-trigger bug.** The old heuristic treated the email local part as a display name when `from_name` was empty, so senders like `invoice+statements+acct_1HNrvlCJoPsRzQsd@stripe.com` (Stripe receipts) and `catch@payments.interac.ca` (Interac e-Transfer alerts) were being scored 0.0 and never auto-dismissed. The fix only inspects the explicit `from_name` field.

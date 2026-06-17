@@ -9,6 +9,8 @@ erDiagram
   customers ||--o{ tickets : has
   customers ||--o{ invoices : billed_to
   tickets ||--o{ time_entries : tracks
+  tickets ||--o{ ticket_messages : contains
+  ticket_messages ||--o{ ticket_message_attachments : has
   pending_emails ||--o| tickets : imports_to
   invoices ||--o{ time_entries : marks_invoiced
   settings ||--|| settings : key_value
@@ -121,10 +123,18 @@ Notes:
 | id | INTEGER | NO | AUTOINCREMENT | PK |
 | ticket_id | INTEGER | NO | — | FK-ish pointer to `tickets.id` |
 | started_at | TEXT | NO | — | |
-| stopped_at | TEXT | YES | — | Null while running |
-| duration_seconds | INTEGER | YES | — | Used for invoice drafts |
+| stopped_at | TEXT | YES | — | Set when timer is finalized/stopped |
+| paused_at | TEXT | YES | — | Set while the active timer is paused |
+| duration_seconds | INTEGER | YES | `0` for active timers | Accumulated elapsed seconds while paused/running; final elapsed seconds after stop |
 | note | TEXT | YES | — | Invoice line description seed |
 | invoiced_at | TEXT | YES | — | Set after invoice creation to avoid double billing |
+
+Timer state:
+
+- Active timers have `stopped_at IS NULL`.
+- Running timers have `stopped_at IS NULL AND paused_at IS NULL`; elapsed time is `duration_seconds + (now - started_at)`.
+- Paused timers have `stopped_at IS NULL AND paused_at IS NOT NULL`; elapsed time is frozen in `duration_seconds`.
+- Stopped timers have `stopped_at IS NOT NULL`; `duration_seconds` is the final billable elapsed time.
 
 ## `settings`
 
@@ -136,6 +146,37 @@ Notes:
 | `default_tax_model` | string | `gst_pst_bc` | One of the six Canadian tax models |
 | `labour_rate_cents_per_hour` | integer cents | `10000` fallback | Money/time revenue and invoice drafts |
 | `minimum_charge_cents` | integer cents | `0` fallback | Private per-invoice floor; only applied when selected/enabled |
+| `email_signature` | plain text | (empty) | Appended to every outbound ticket reply (text + escaped HTML). Plain text only by design — see `docs/security.md`. |
+| `agent_mailbox_from` | CSV | `johnn5wizbot@gmail.com` | From-addresses treated as operational agent traffic |
+| `auto_dismiss_domains` | CSV | (empty) | Domains that always count as junk (+0.6 score) |
+| `auto_keep_subjects` | CSV | (empty) | Subject substrings that are NEVER auto-dismissed |
+| `ai_high_provider` / `ai_cheap_provider` | string | `minimax` | Two-tier AI provider routing |
+
+## `ticket_messages`
+
+| Column | Type | Null | Default | Notes |
+|---|---|---|---|---|
+| id | INTEGER | NO | AUTOINCREMENT | PK |
+| ticket_id | INTEGER | NO | — | FK → `tickets.id` |
+| sender | TEXT | NO | — | `admin`, `customer`, or `system` |
+| body | TEXT | NO | — | Plain-text body (canonical) |
+| body_html | TEXT | YES | — | Sanitized HTML for iframe rendering (cid: → `/api/attachments/:id/raw` already rewritten) |
+| subject | TEXT | YES | — | Per-message subject (set for the first message of a thread; used for thread re-creation) |
+| gmail_message_id | TEXT | YES | — | Idempotency key — unique index. Used by the reply matcher to detect "already appended" on re-scan. |
+| source_message_id | TEXT | YES | — | The Gmail `In-Reply-To` / `References` header that placed this message in the thread. Audit / cross-reference. |
+| ai_draft | INTEGER | NO | `0` | 1 if this admin message was an AI-drafted reply |
+| created_at | TEXT | NO | CURRENT_TIMESTAMP | |
+
+Indexes:
+
+- `idx_messages_ticket (ticket_id, created_at)`
+- `idx_ticket_messages_gmail_msgid` unique (when `gmail_message_id IS NOT NULL`)
+- `idx_ticket_messages_source_msgid` (when `source_message_id IS NOT NULL`)
+
+Notes:
+
+- `body_html` is sanitized on write (`sanitizeEmailHtml` in `lib/attachments.js`): strips `<script>`, `<iframe>`, `<object>`, `<embed>`, `<link>`, `on*` handlers, `javascript:` URLs. Renders inside a sandboxed iframe in the UI.
+- The reply matcher (`lib/replies.js`) appends new customer messages here when a Gmail message is recognized as a reply to an existing open ticket. The poller and the manual Import button both go through this path.
 
 ## Tax models
 

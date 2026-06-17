@@ -78,10 +78,30 @@ export async function buildServer(opts = {}) {
     startPoller({
       intervalMin: inboxConfig.pollIntervalMin,
       onNewMessage: async (msg) => {
-        app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message queued for review');
+        app.log.info({ from: msg.fromEmail, subject: msg.subject }, 'inbox: new message');
+        try {
+          // Byron-iter 2026-06-16: try to auto-append the message to an
+          // existing ticket thread before parking it in the pending
+          // queue. This is the path that makes customer replies show
+          // up in the ticket conversation without a manual re-import.
+          const { matchReplyToTicket, markImportedRead } = await import('./lib/replies.js');
+          const matched = await matchReplyToTicket(app.db, msg);
+          if (matched && !matched.already_appended) {
+            app.log.info({ ticket_id: matched.ticket_id, source: matched.source }, 'inbox: reply appended to existing ticket');
+            const r = await markImportedRead(msg.messageId);
+            app.log.info({ ok: r.ok }, 'inbox: marked reply read');
+            return;
+          }
+          if (matched && matched.already_appended) {
+            app.log.info({ ticket_id: matched.ticket_id }, 'inbox: reply already appended (idempotent)');
+            return;
+          }
+        } catch (e) {
+          app.log.warn({ err: e.message }, 'inbox: reply matcher error; falling back to queue');
+        }
         try {
           const result = await scanPendingEmails(app.db, { limit: 1 });
-          app.log.info({ inserted: result.inserted, skipped: result.skipped_existing }, 'inbox: queued');
+          app.log.info({ inserted: result.inserted, skipped: result.skipped_existing }, 'inbox: queued for review');
         } catch (e) {
           app.log.warn({ err: e.message }, 'inbox: queue failed');
         }

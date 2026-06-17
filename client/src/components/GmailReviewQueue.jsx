@@ -1,7 +1,8 @@
 import { useEffect, useState, useCallback, useMemo } from 'react';
 import { fetchJson, postJson } from '../lib/api.js';
-import { Mail, RefreshCw, Inbox as InboxIcon, Loader2, Star, X, RotateCcw } from 'lucide-react';
+import { Mail, RefreshCw, Inbox as InboxIcon, Loader2, Star, X, RotateCcw, Eye } from 'lucide-react';
 import ContactEnrichmentModal from './ContactEnrichmentModal.jsx';
+import EmailPreviewModal from './EmailPreviewModal.jsx';
 
 /**
  * GmailReviewQueue
@@ -99,6 +100,10 @@ export default function GmailReviewQueue({ onImported }) {
   // Contacts match for the sender. Server does the lookup, client just
   // asks the admin which fields to apply.
   const [enrichmentMatch, setEnrichmentMatch] = useState(null);
+  // Email preview modal: shown when the admin clicks the Preview button
+  // on a row. The modal fetches /api/inbox/pending/:id/preview and
+  // renders the email exactly as it'll appear on the ticket page.
+  const [previewId, setPreviewId] = useState(null);
   // Bulk-dismiss: Set of selected pending row ids. Bulk-dismiss button
   // acts on all of them in one POST.
   const [selectedIds, setSelectedIds] = useState(new Set());
@@ -561,6 +566,17 @@ export default function GmailReviewQueue({ onImported }) {
                 </div>
                 <div className="flex gap-2 shrink-0">
                   {p.status === 'pending' && (
+                    <button
+                      className="btn-ghost text-xs flex items-center gap-1"
+                      onClick={() => setPreviewId(p.id)}
+                      disabled={busyId === p.id}
+                      data-testid={`preview-btn-${p.id}`}
+                      title="Preview this email as it would appear in the ticket"
+                    >
+                      <Eye size={11} /> Preview
+                    </button>
+                  )}
+                  {p.status === 'pending' && (
                     <>
                       <button className="btn-primary text-xs" onClick={() => importOne(p.id)} disabled={busyId === p.id}>
                         Import
@@ -593,6 +609,13 @@ export default function GmailReviewQueue({ onImported }) {
           onApply={() => setEnrichmentMatch(null)}
           onSkip={() => setEnrichmentMatch(null)}
           onClose={() => setEnrichmentMatch(null)}
+        />
+      )}
+
+      {previewId && (
+        <EmailPreviewModal
+          pendingId={previewId}
+          onClose={() => setPreviewId(null)}
         />
       )}
     </section>

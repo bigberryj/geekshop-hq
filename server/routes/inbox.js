@@ -23,7 +23,19 @@ import {
   listPendingEmails,
   backfillClassifyPendingEmails,
   readModerationSettings,
+  listPendingAttachments,
 } from '../lib/pending-emails.js';
+import { fetchByMessageId } from '../lib/email-inbox.js';
+import { readFileSync } from 'node:fs';
+import {
+  resolveAttachmentPath,
+  attachmentSize,
+  ATTACHMENT_MAX_BYTES,
+  sanitizeEmailHtml,
+  persistAttachment,
+  deleteAttachment,
+} from '../lib/attachments.js';
+import { findAttachmentById } from '../lib/attachment-lookup.js';
 
 export async function inboxRoutes(app) {
   app.get('/api/inbox/status', async () => ({
@@ -167,9 +179,155 @@ export async function inboxRoutes(app) {
     }
   });
 
-  // Read the moderation settings (junk override lists + agent mailbox)
+  // Read the moderation settings (junk classifier overrides + agent mailbox)
   // for the UI. Exposed read-only.
   app.get('/api/inbox/moderation-settings', async () => readModerationSettings(app.db));
+
+  // Attachment metadata for a pending email. No raw bytes here.
+  app.get('/api/inbox/pending/:id/attachments', async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
+    const row = app.db.prepare('SELECT id, status FROM pending_emails WHERE id = ?').get(id);
+    if (!row) return reply.code(404).send({ error: 'not found' });
+    return { items: listPendingAttachments(app.db, id) };
+  });
+
+  // Raw bytes of a pending-email attachment.
+  app.get('/api/inbox/pending/:id/attachments/:aid/raw', async (req, reply) => {
+    const id = Number(req.params.id);
+    const aid = Number(req.params.aid);
+    if (!Number.isInteger(id) || !Number.isInteger(aid)) return reply.code(400).send({ error: 'invalid id' });
+    const row = app.db.prepare('SELECT storage_path, mime_type, filename FROM pending_email_attachments WHERE id = ? AND pending_email_id = ?').get(aid, id);
+    if (!row) return reply.code(404).send({ error: 'not found' });
+    const abs = resolveAttachmentPath(row.storage_path);
+    if (!abs) return reply.code(404).send({ error: 'file missing' });
+    reply.header('Content-Type', row.mime_type || 'application/octet-stream');
+    reply.header('Content-Length', String(attachmentSize(row.storage_path)));
+    reply.header('Content-Disposition', `inline; filename="${(row.filename || 'attachment').replace(/"/g, '')}"`);
+    return reply.send(readFileSync(abs));
+  });
+
+  // Raw bytes of a ticket-message attachment (used by the email
+  // render on the ticket page, and by AI vision to fetch bytes).
+  app.get('/api/attachments/:id/raw', async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
+    const att = findAttachmentById(app.db, id);
+    if (!att) return reply.code(404).send({ error: 'not found' });
+    const abs = resolveAttachmentPath(att.storage_path);
+    if (!abs) return reply.code(404).send({ error: 'file missing' });
+    reply.header('Content-Type', att.mime_type || 'application/octet-stream');
+    reply.header('Content-Length', String(attachmentSize(att.storage_path)));
+    reply.header('Content-Disposition', `inline; filename="${(att.filename || 'attachment').replace(/"/g, '')}"`);
+    return reply.send(readFileSync(abs));
+  });
+
+  // Email preview (sanitized HTML with inline images rewritten).
+  // On-demand fetches from Gmail if we don't yet have a body/html
+  // stored on the row. Returns { subject, from_*, date, body_text,
+  // body_html (sanitized), attachments, missing_inline_cids[] }.
+  app.get('/api/inbox/pending/:id/preview', async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) return reply.code(400).send({ error: 'invalid id' });
+    const row = app.db.prepare('SELECT * FROM pending_emails WHERE id = ?').get(id);
+    if (!row) return reply.code(404).send({ error: 'not found' });
+
+    // Helper: the original scan only stored bodies for the 25 most recent
+    // messages. Older rows and rows that had only a snippet/empty body
+    // still need a Gmail refetch. Treat any non-string / whitespace-only
+    // body as missing so the refetch actually fires.
+    const isMissing = (v) => typeof v !== 'string' || v.trim() === '';
+
+    let html = row.body_html || null;
+    let freshBody = null;
+    if (!html && row.message_id) {
+      try {
+        const full = await fetchByMessageId(row.message_id);
+        if (full) {
+          html = full.html || null;
+          freshBody = full.body || null;
+          // Persist the body so subsequent previews / re-imports don't
+          // re-hit Gmail.
+          app.db.prepare(`
+            UPDATE pending_emails
+            SET body = COALESCE(NULLIF(?, ''), body),
+                snippet = CASE WHEN snippet IS NULL OR snippet = '' THEN ? ELSE snippet END,
+                body_html = ?,
+                body_fetched_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+          `).run(
+            full.body || '',
+            (full.body || full.subject || '').slice(0, 200).replace(/\s+/g, ' ').trim(),
+            html,
+            id
+          );
+          // Persist any attachments we just pulled.
+          if (Array.isArray(full.attachments) && full.attachments.length) {
+            const insertAttach = app.db.prepare(`
+              INSERT INTO pending_email_attachments (pending_email_id, filename, mime_type, size_bytes, content_id, disposition, storage_path)
+              VALUES (?, ?, ?, ?, ?, ?, ?)
+            `);
+            // Clean any stale envelope rows.
+            const old = app.db.prepare('SELECT storage_path FROM pending_email_attachments WHERE pending_email_id = ?').all(id);
+            for (const r of old) deleteAttachment(r.storage_path);
+            app.db.prepare('DELETE FROM pending_email_attachments WHERE pending_email_id = ?').run(id);
+            for (const a of full.attachments) {
+              if (!a || !a.buffer) continue;
+              try {
+                const p = persistAttachment({
+                  scope: 'pending',
+                  rowId: id,
+                  filename: a.filename,
+                  mimeType: a.mimeType,
+                  buffer: a.buffer,
+                  contentId: a.contentId,
+                  disposition: a.disposition,
+                });
+                insertAttach.run(id, p.filename, p.mimeType, p.sizeBytes, p.contentId, p.disposition, p.storagePath);
+              } catch (e) {
+                console.warn('[inbox] preview: attachment skipped', a.filename, e.message);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[inbox] preview: on-demand fetch failed:', e.message);
+      }
+    }
+
+    const attachments = listPendingAttachments(app.db, id);
+    // Build the cid -> attachment_id lookup. We use the content_id
+    // value (with angle brackets stripped) as the key.
+    const cidMap = new Map();
+    for (const a of attachments) {
+      if (a.content_id) {
+        const clean = String(a.content_id).replace(/^<|>$/g, '');
+        cidMap.set(clean, a.id);
+      }
+    }
+    // Rewrite `cid:` references to point at our raw-bytes endpoint, then
+    // sanitize. If there is no html but we do have a text body, fall
+    // back to a tiny wrapped HTML doc so the modal can still render in
+    // its iframe and keep styling consistent.
+    let displayHtml = '';
+    if (html) {
+      displayHtml = sanitizeEmailHtml(html, (cid) => cidMap.get(cid) || null);
+    } else if (!isMissing(row.body)) {
+      const escaped = String(row.body).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+      displayHtml = `<pre style="white-space:pre-wrap;font-family:inherit;margin:0">${escaped}</pre>`;
+    }
+    return {
+      id: row.id,
+      message_id: row.message_id,
+      from_name: row.from_name,
+      from_email: row.from_email,
+      subject: row.subject,
+      date: row.received_at,
+      body_text: !isMissing(row.body) ? row.body : (freshBody || row.snippet || ''),
+      body_html: displayHtml,
+      attachments,
+    };
+  });
 
   // Backfill classification on pending rows that don't have one yet.
   // Byron-iter 2026-06-16: the legacy queue has 554 un-classified rows

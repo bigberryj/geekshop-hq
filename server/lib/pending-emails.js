@@ -12,6 +12,7 @@
 import { fetchUnread, fetchByMessageId, inboxConfig } from './email-inbox.js';
 import { findContactMatch } from './google-contacts.js';
 import { classifyEmail, scoreEmail, isAgentMail } from './junk-classifier.js';
+import { persistAttachment, deleteAttachment, readAttachmentBuffer, sanitizeEmailHtml } from './attachments.js';
 
 function findOrCreateCustomer(db, { email, name }) {
   if (email) {
@@ -156,6 +157,46 @@ export async function scanPendingEmails(db, {
         isAutoJunk ? classification.reason : null,  // col 12: dismissed_reason
         JSON.stringify({ score: classification.score, signals: classification.signals, classified_by: classification.classifiedBy, classified_at: new Date().toISOString() }),  // col 13: classification
       );
+      const pendingId = db.prepare('SELECT last_insert_rowid() AS id').get().id;
+
+      // Persist any attachments to disk + DB. We do this only for
+      // non-auto-junk rows because auto-dismissed mail gets deleted
+      // (along with its files) on the next sweep. Inline images that
+      // make it into the queue will be picked up by the preview + import
+      // path; oversized or unsupported attachments are silently skipped
+      // (logged, never thrown — the scan should never break on a
+      // malformed attachment).
+      if (!isAutoJunk && Array.isArray(m.attachments) && m.attachments.length) {
+        const insertAttach = db.prepare(`
+          INSERT INTO pending_email_attachments (pending_email_id, filename, mime_type, size_bytes, content_id, disposition, storage_path)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `);
+        for (const a of m.attachments) {
+          if (!a || !a.buffer) continue;
+          try {
+            const persisted = persistAttachment({
+              scope: 'pending',
+              rowId: pendingId,
+              filename: a.filename,
+              mimeType: a.mimeType,
+              buffer: a.buffer,
+              contentId: a.contentId,
+              disposition: a.disposition,
+            });
+            insertAttach.run(
+              pendingId,
+              persisted.filename,
+              persisted.mimeType,
+              persisted.sizeBytes,
+              persisted.contentId,
+              persisted.disposition,
+              persisted.storagePath,
+            );
+          } catch (e) {
+            console.warn('[inbox] attachment skipped', a.filename, e.message);
+          }
+        }
+      }
       if (isAutoJunk) {
         result.auto_dismissed += 1;
         db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('auto', 'pending_email.auto_dismiss', ?, ?)")
@@ -187,20 +228,97 @@ export async function importPendingEmail(db, pendingId) {
   }
   if (row.status === 'dismissed') throw new Error('pending email was dismissed');
 
-  // Fetch body from Gmail on demand if we don't have it. Fall back to
-  // snippet/subject gracefully if Gmail is down.
+  // On-demand body fetch from Gmail. The original scan only pulled
+  // bodies for the 25 most recent messages, so anything older (or
+  // anything where the first fetch failed) needs this re-pull.
+  // The re-pull returns the full body, html, AND attachments — we
+  // persist all three so the imported ticket page can render the
+  // email exactly as it looked in Gmail (with inline images etc).
   let body = row.body;
-  if (!body && row.message_id) {
+  let bodyHtml = null;
+  let liveAttachments = null; // array, when re-pulled from Gmail
+  if (row.message_id) {
     try {
       const full = await fetchByMessageId(row.message_id);
-      if (full && (full.body || full.subject)) {
-        body = full.body || full.subject;
-        // Persist for next time (in case the import is undone somehow)
-        db.prepare('UPDATE pending_emails SET body = ?, snippet = ? WHERE id = ?')
-          .run(full.body || '', (full.body || full.subject || '').slice(0, 200).replace(/\s+/g, ' ').trim(), pendingId);
+      if (full && (full.body || full.html || full.subject || Array.isArray(full.attachments))) {
+        // If the pending row already had a full text body, keep it as the
+        // canonical plain-text import body. We still re-pull Gmail to capture
+        // HTML/attachments for rich rendering, but we must not overwrite a
+        // known-good body with a later mock/fallback fetch result.
+        if (!body && (full.body || full.subject)) {
+          body = full.body || full.subject;
+        }
+        bodyHtml = full.html || null;
+        liveAttachments = Array.isArray(full.attachments) ? full.attachments : null;
+        // Persist the body so subsequent previews / re-imports don't
+        // re-hit Gmail, but only fill blanks.
+        if (!row.body && full.body) {
+          db.prepare(`
+            UPDATE pending_emails
+            SET body = ?, snippet = ?
+            WHERE id = ?
+          `).run(
+            full.body || '',
+            (full.body || full.subject || '').slice(0, 200).replace(/\s+/g, ' ').trim(),
+            pendingId
+          );
+        }
       }
     } catch (e) {
       console.warn('[inbox] on-demand body fetch failed:', e.message);
+    }
+  }
+
+  // Reply-merge path. Before creating a brand-new ticket, ask the
+  // matcher whether this Gmail message is a reply to an existing
+  // open ticket for the same customer. If so, append the message to
+  // that ticket, mark the Gmail message read, mark the pending row
+  // imported, and return — the new-ticket path is skipped entirely.
+  // This keeps the manual "Import" button behaviour identical to the
+  // poller's auto-append behaviour.
+  if (row.message_id) {
+    try {
+      const { matchReplyToTicket, markImportedRead } = await import('./replies.js');
+      const matcherMsg = {
+        messageId: row.message_id,
+        fromEmail: row.from_email,
+        from: row.from_name,
+        subject: row.subject,
+        body,
+        html: bodyHtml,
+        attachments: liveAttachments,
+        date: row.received_at ? new Date(row.received_at) : new Date(),
+      };
+      const matched = await matchReplyToTicket(db, matcherMsg);
+      if (matched) {
+        if (!matched.already_appended) {
+          // Mark Gmail message read. Best-effort; never throws.
+          markImportedRead(row.message_id).catch(() => {});
+        }
+        // Always flip the pending row to imported (whether we just
+        // appended it via the matcher, or a previous run already
+        // appended it). This prevents the new-ticket path from
+        // duplicating the message on the existing ticket.
+        db.prepare("UPDATE pending_emails SET status='imported', imported_ticket_id=?, decided_at=CURRENT_TIMESTAMP WHERE id=?")
+          .run(matched.ticket_id, pendingId);
+        db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', ?, ?, ?)")
+          .run(
+            matched.already_appended ? 'pending_email.reply_already_appended' : 'pending_email.reply_merged',
+            String(matched.ticket_id),
+            JSON.stringify({ pending_id: pendingId, from_email: row.from_email, source: matched.source }),
+          );
+        const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(matched.ticket_id);
+        return {
+          ticket,
+          customer: null,
+          already_imported: matched.already_appended,
+          contactMatch: null,
+          ...(matched.already_appended ? {} : { merged_into_existing: true }),
+        };
+      }
+    } catch (e) {
+      console.warn('[inbox] reply matcher on import failed:', e.message);
+      // fall through to the new-ticket path
     }
   }
 
@@ -210,14 +328,129 @@ export async function importPendingEmail(db, pendingId) {
     INSERT INTO tickets (ticket_uid, customer_id, subject, priority, source, source_message_id, last_message_at)
     VALUES (?, ?, ?, 'normal', 'email', ?, CURRENT_TIMESTAMP)
   `).run(uid, customer.id, row.subject, row.message_id);
-  db.prepare(`
-    INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, 'customer', ?)
-  `).run(tInfo.lastInsertRowid, body || row.snippet || row.subject);
+  const ticketId = tInfo.lastInsertRowid;
+
+  // Insert the customer message. body_html is null if Gmail was
+  // unreachable OR if the email was plain-text only. The UI shows
+  // `body` (text) when body_html is null and a sandboxed iframe of
+  // body_html when present.
+  const msgInfo = db.prepare(`
+    INSERT INTO ticket_messages (ticket_id, sender, body, body_html, subject)
+    VALUES (?, 'customer', ?, ?, ?)
+  `).run(ticketId, body || row.snippet || row.subject, bodyHtml, row.subject);
+  const messageId = msgInfo.lastInsertRowid;
+  // Persist attachments. Two sources:
+  //   1. liveAttachments — if we just re-pulled from Gmail. These are
+  //      the source of truth; ignore any pending_email_attachments
+  //      rows that already exist (they're stale envelopes).
+  //   2. pending_email_attachments — anything the original scan
+  //      captured. Use these when no live re-pull happened.
+  const liveAttachInsert = db.prepare(`
+    INSERT INTO ticket_message_attachments (ticket_message_id, filename, mime_type, size_bytes, content_id, disposition, storage_path)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  if (liveAttachments && liveAttachments.length) {
+    // Wipe the old envelope-only rows first.
+    const oldRows = db.prepare('SELECT storage_path FROM pending_email_attachments WHERE pending_email_id = ?').all(pendingId);
+    for (const r of oldRows) deleteAttachment(r.storage_path);
+    db.prepare('DELETE FROM pending_email_attachments WHERE pending_email_id = ?').run(pendingId);
+    for (const a of liveAttachments) {
+      if (!a || !a.buffer) continue;
+      try {
+        const persisted = persistAttachment({
+          scope: 'tickets',
+          rowId: ticketId,
+          filename: a.filename,
+          mimeType: a.mimeType,
+          buffer: a.buffer,
+          contentId: a.contentId,
+          disposition: a.disposition,
+        });
+        liveAttachInsert.run(
+          messageId,
+          persisted.filename,
+          persisted.mimeType,
+          persisted.sizeBytes,
+          persisted.contentId,
+          persisted.disposition,
+          persisted.storagePath,
+        );
+      } catch (e) {
+        console.warn('[inbox] import: attachment skipped', a.filename, e.message);
+      }
+    }
+  } else {
+    // No live re-pull — copy the pending attachments into the ticket bucket.
+    const pending = db.prepare(`
+      SELECT filename, mime_type, size_bytes, content_id, disposition, storage_path
+      FROM pending_email_attachments WHERE pending_email_id = ?
+    `).all(pendingId);
+    for (const a of pending) {
+      try {
+        const persisted = persistAttachment({
+          scope: 'tickets',
+          rowId: ticketId,
+          filename: a.filename,
+          mimeType: a.mimeType,
+          // Re-persist from the existing on-disk file. We re-read it
+          // here so the same content lives under tickets/ too —
+          // simpler than a "move" because the on-demand path also
+          // writes back to pending/ on a re-import.
+          buffer: readAttachmentBuffer(a.storage_path),
+          contentId: a.content_id,
+          disposition: a.disposition,
+        });
+        liveAttachInsert.run(
+          messageId,
+          persisted.filename,
+          persisted.mimeType,
+          persisted.sizeBytes,
+          persisted.contentId,
+          persisted.disposition,
+          persisted.storagePath,
+        );
+      } catch (e) {
+        console.warn('[inbox] import: attachment copy failed', a.filename, e.message);
+      }
+    }
+  }
+
+  // Sanitize the imported body_html and rewrite cid: image references
+  // to our /api/attachments/:id/raw route so inline graphics render
+  // inside the ticket page's sandboxed iframe. We re-write the row
+  // with the sanitized HTML so the ticket page can render it directly
+  // without re-sanitizing at request time.
+  if (bodyHtml) {
+    const cidMap = new Map();
+    for (const a of db.prepare(`
+      SELECT id, content_id FROM ticket_message_attachments
+      WHERE ticket_message_id = ? AND content_id IS NOT NULL
+    `).all(messageId)) {
+      const cleanCid = String(a.content_id).replace(/^<|>$/g, '');
+      if (cleanCid) cidMap.set(cleanCid, a.id);
+    }
+    const sanitized = sanitizeEmailHtml(bodyHtml, (cid) => cidMap.get(cid) || null);
+    db.prepare('UPDATE ticket_messages SET body_html = ? WHERE id = ?')
+      .run(sanitized, messageId);
+    bodyHtml = sanitized;
+  }
+
   db.prepare("UPDATE pending_emails SET status='imported', imported_ticket_id=?, decided_at=CURRENT_TIMESTAMP WHERE id=?")
-    .run(tInfo.lastInsertRowid, pendingId);
+    .run(ticketId, pendingId);
   db.prepare("INSERT INTO audit_log (actor, action, target, payload) VALUES ('admin', 'pending_email.import', ?, ?)")
-    .run(String(tInfo.lastInsertRowid), JSON.stringify({ pending_id: pendingId, from_email: row.from_email }));
-  const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(tInfo.lastInsertRowid);
+    .run(String(ticketId), JSON.stringify({ pending_id: pendingId, from_email: row.from_email }));
+  const ticket = db.prepare('SELECT * FROM tickets WHERE id = ?').get(ticketId);
+
+  // Mark Gmail message read. Best-effort; never throws, never blocks
+  // the import. This keeps the inbox visually in sync with what we've
+  // already imported into the dashboard.
+  if (row.message_id) {
+    try {
+      const { markImportedRead } = await import('./replies.js');
+      // Don't await — the response should return to the user ASAP.
+      markImportedRead(row.message_id).catch(() => {});
+    } catch { /* lib not loaded yet — non-fatal */ }
+  }
 
   // Look up the sender in Google Contacts so the admin can pre-populate
   // missing customer fields (phone, company, address). Best-effort:
@@ -320,7 +553,21 @@ export function listPendingEmails(db, { status = 'pending', limit = 50, offset =
 }
 
 /**
- * Read all the moderation settings (junk classifier overrides + agent
+ * List attachments for a pending email. Returns [{ id, filename,
+ * mime_type, size_bytes, content_id, disposition }] without the
+ * raw bytes (those are served via /raw on a separate request).
+ */
+export function listPendingAttachments(db, pendingId) {
+  return db.prepare(`
+    SELECT id, filename, mime_type, size_bytes, content_id, disposition
+    FROM pending_email_attachments
+    WHERE pending_email_id = ?
+    ORDER BY id ASC
+  `).all(pendingId);
+}
+
+/**
+ * Read the moderation settings (junk classifier overrides + agent
  * mailbox) from the `settings` table and return them in a shape
  * scoreEmail() / isAgentMail() understand. Single source of truth so
  * the classifier never reads the DB directly.

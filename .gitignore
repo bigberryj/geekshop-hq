@@ -4,6 +4,7 @@ node_modules/
 .env.local
 data/*.db
 data/*.db-*
+data/attachments/
 dist/
 build/
 .vitest/

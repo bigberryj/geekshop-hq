@@ -2,12 +2,19 @@
  * Gmail IMAP poller + fetcher.
  *
  * Polls byron@geekshop.ca every N minutes (env: BYRON_GMAIL_POLL_INTERVAL_MIN, default 5).
- * Returns parsed messages with from/subject/date/body/messageId.
+ * Returns parsed messages with from/subject/date/body/messageId/html/attachments.
  *
  * Used by:
  *   - background poller in index.js (auto-creates tickets if BYRON_GMAIL_AUTO_CREATE_TICKETS=true)
  *   - GET /api/inbox/unread (manual inbox view)
  *   - POST /api/inbox/import-as-ticket (single-message import)
+ *
+ * Byron-iter 2026-06-16: capture `html` body and `attachments` on every
+ * fetch. Attachments are returned as in-memory Buffers; the caller
+ * (`pending-emails.js` or wherever) is responsible for persisting them
+ * to disk via lib/attachments.js. The "first 25 bodies" optimisation
+ * is preserved — older entries get envelope-only metadata and an
+ * on-demand body fetch will pull attachments when the admin opens them.
  */
 
 import { ImapFlow } from 'imapflow';
@@ -35,41 +42,68 @@ async function withClient(fn) {
 }
 
 /**
+ * Normalize a mailparser attachment into the shape we hand to the
+ * caller. We carry the Buffer in-memory; the caller decides whether
+ * to persist it. Filenames get lightly sanitized here.
+ *
+ * Returns:
+ *   { filename, mimeType, sizeBytes, contentId, disposition, buffer }
+ */
+function normalizeAttachment(a) {
+  if (!a) return null;
+  // mailparser exposes `cid` as a string without angle brackets. We
+  // also keep the raw `contentId` (with brackets) for the email HTML
+  // rewriter.
+  const cid = a.cid || null;
+  const contentId = a.contentId || (cid ? `<${cid}>` : null);
+  // `a.content` is a Buffer; some attachments come as Streams (rare on
+  // gmail but possible). Stream handling is left to the caller — the
+  // server-side `import` path will request the source from IMAP
+  // directly in those cases.
+  const buf = Buffer.isBuffer(a.content) ? a.content : null;
+  return {
+    filename: a.filename || (cid ? `inline-${cid}` : 'attachment'),
+    mimeType: a.contentType || 'application/octet-stream',
+    sizeBytes: buf ? buf.length : 0,
+    contentId,
+    disposition: a.contentDisposition === 'inline' ? 'inline' : 'attachment',
+    buffer: buf,
+  };
+}
+
+/**
  * Fetch recent unread + (optionally) starred messages within a date window.
- * Returns [{ messageId, from, fromEmail, subject, date, body, snippet, uid, flagged }]
+ * Returns [{ messageId, from, fromEmail, subject, date, body, html, snippet, uid, flagged, attachments }]
  *
  * Options:
  *   - since:     Date   earliest message date to include. Default = now - 24h.
  *   - until:     Date   latest message date to include. Default = no upper bound.
- *   - includeStarred: boolean  if true, also pull \Flagged (Gmail "starred")
- *                      messages, even if read. Default true for the manual scan.
- *   - limit:     number max messages to fetch. Hard cap 100.
+ *   - includeStarred: boolean  if true (default), also pull messages with the
+ *                      \Flagged IMAP flag, even if read. Used by the manual
+ *                      "Scan Gmail now" button.
+ *   - limit:     number max messages to fetch. Default 25. Hard cap 100.
+ *   - withAttachments: boolean  if true, also fetch the on-disk body for
+ *                      every message in the window (slower). Default false
+ *                      (only the first BODY_FETCH_LIMIT rows get bodies;
+ *                      the rest are envelope-only and need an on-demand
+ *                      fetch at preview/import time).
  */
 export async function fetchUnread({
   since,
   until,
   includeStarred = true,
   limit = 25,
+  withAttachments = false,
 } = {}) {
   if (!(since instanceof Date)) since = new Date(Date.now() - 24 * 60 * 60 * 1000);
   const cappedLimit = Math.min(Math.max(Number(limit) || 25, 1), 100);
-  // IMAP SINCE / BEFORE search keys take a JS Date.
-  // "Recent first" ordering: we don't trust the server's sort so we sort
-  // ourselves by internalDate after fetch.
   return withClient(async (client) => {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // Two search keys:
-      //   1) unread within window  (always)
-      //   2) starred within window (if includeStarred)
-      // We OR them at the IMAP level so the server filters before we fetch
-      // bodies, which is the difference between ~50ms and a multi-second
-      // body fetch on a big mailbox.
       const searchKey = { since, ...(until ? { before: until } : {}), or: true };
       const searches = [{ ...searchKey, unseen: true }];
       if (includeStarred) searches.push({ ...searchKey, flagged: true });
 
-      // Collect sequence numbers across both searches, deduped.
       const seqSet = new Set();
       for (const k of searches) {
         const s = await client.search(k);
@@ -77,17 +111,12 @@ export async function fetchUnread({
       }
       const allSeqs = [...seqSet];
       if (!allSeqs.length) return [];
-      // Most recent first: sort by sequence number descending (highest = newest).
       allSeqs.sort((a, b) => b - a);
       const recent = allSeqs.slice(0, cappedLimit);
       const range = recent.length === 1
         ? String(recent[0])
         : `${recent[0]}:${recent[recent.length - 1]}`;
       console.log('[inbox] fetchUnread: seqs', recent.length, 'range', range, 'since', since.toISOString());
-      // Fetch metadata-only first (envelope, flags) to filter cheaply, then
-      // pull bodies in parallel only for messages that survive the date
-      // filter. This avoids paying the body-transfer cost for 100 large
-      // messages when the user only needs a handful within the window.
       const metaOpts = { envelope: true, flags: true, internalDate: true, uid: true };
       const candidates = [];
       for await (const msg of client.fetch(range, metaOpts)) {
@@ -100,18 +129,14 @@ export async function fetchUnread({
           seq: msg.seq,
           internalDate: d,
           flagged: !!(msg.flags && msg.flags.has('\\Flagged')),
-          // Capture envelope metadata so bodyless rows still render properly
           fromName: envFrom?.name || null,
           fromEmail: envFrom?.address || null,
           subject: msg.envelope?.subject || null,
         });
       }
-      // Now fetch bodies — but only for the most recent 25, since the
-      // snippet we extract is what's shown in the queue UI and the
-      // full body is only needed at import time. Older entries get
-      // envelope-only metadata. IMAP fetch on a single connection is
-      // serial anyway, so this is the same as parallel but clearer.
-      const BODY_FETCH_LIMIT = 25;
+      // Body fetch — full (with attachments) only for the recent window.
+      // Older entries stay envelope-only until the admin opens them.
+      const BODY_FETCH_LIMIT = withAttachments ? candidates.length : 25;
       const out = [];
       for (let i = 0; i < candidates.length; i++) {
         const cand = candidates[i];
@@ -130,6 +155,8 @@ export async function fetchUnread({
         const from = parsed?.from?.value?.[0] || (cand.fromEmail ? { name: cand.fromName, address: cand.fromEmail } : null);
         const subject = parsed?.subject || cand.subject || '(no subject)';
         const text = parsed?.text || parsed?.html || '';
+        const html = parsed?.html || null;
+        const attachments = (parsed?.attachments || []).map(normalizeAttachment).filter(Boolean);
         out.push({
           uid: cand.uid,
           messageId: parsed?.messageId || String(cand.uid),
@@ -138,11 +165,12 @@ export async function fetchUnread({
           subject,
           date: parsed?.date || cand.internalDate,
           body: text,
+          html,
           snippet: text ? text.slice(0, 200).replace(/\s+/g, ' ').trim() : (subject || '').slice(0, 200),
           flagged: cand.flagged,
+          attachments,
         });
       }
-      // Sort by date descending — Gmail's seq order can be off for threads.
       out.sort((a, b) => (b.date?.getTime?.() || 0) - (a.date?.getTime?.() || 0));
       return out;
     } finally {
@@ -152,7 +180,10 @@ export async function fetchUnread({
 }
 
 /**
- * Fetch a single message by messageId header.
+ * Fetch a single message by messageId header. Always returns the full
+ * body + attachments (this is the on-demand path used by the preview
+ * modal and the import route). Attachments are in-memory; the caller
+ * persists them.
  */
 export async function fetchByMessageId(messageId) {
   return withClient(async (client) => {
@@ -163,6 +194,7 @@ export async function fetchByMessageId(messageId) {
       for await (const msg of client.fetch(uids, { uid: true, source: true, envelope: true })) {
         const parsed = await simpleParser(msg.source);
         const from = parsed.from?.value?.[0];
+        const text = parsed.text || parsed.html || '';
         return {
           uid: msg.uid,
           messageId: parsed.messageId,
@@ -170,7 +202,9 @@ export async function fetchByMessageId(messageId) {
           fromEmail: from?.address,
           subject: parsed.subject,
           date: parsed.date,
-          body: parsed.text || parsed.html || '',
+          body: text,
+          html: parsed.html || null,
+          attachments: (parsed.attachments || []).map(normalizeAttachment).filter(Boolean),
         };
       }
       return null;
@@ -184,29 +218,22 @@ export async function fetchByMessageId(messageId) {
  * Apply a label to a message. Creates the label if it doesn't exist (Gmail IMAP
  * label = a folder; we use `\HasChildren` to create a real label under INBOX).
  * Returns the path of the label that was applied (or already existed).
- *
- * Note: imapflow's setFlags + 'gmail-label' is the canonical way. We use a
- * simpler approach — store the message in a folder-like mailbox, which Gmail
- * treats as a label. This is the IMAP-equivalent of "add label X".
  */
 export async function applyLabel({ messageId, labelPath }) {
   if (!hasCreds()) throw new Error('Gmail creds not configured');
   return withClient(async (client) => {
     const lock = await client.getMailboxLock('INBOX');
     try {
-      // 1. Find the UID by message-id header
       const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
       if (!uids.length) return { ok: false, reason: 'message not found in INBOX' };
       const uid = uids[0];
 
-      // 2. Make sure the label mailbox exists (Gmail auto-creates on append)
       try {
         await client.mailboxOpen(labelPath, { readOnly: false });
       } catch (e) {
         // mailboxOpen may fail if not yet created; the append below will create it
       }
 
-      // 3. Re-open INBOX with write access and copy the message to the label
       const inboxLock = await client.getMailboxLock('INBOX');
       try {
         await client.messageCopy(String(uid), labelPath, { uid: true });
@@ -236,13 +263,10 @@ export async function markRead({ messageId, archive = false }) {
       if (!uids.length) return { ok: false, reason: 'message not found' };
       const uid = uids[0];
 
-      // Set \Seen flag (= Gmail's "read" state, removes UNREAD label)
       await client.messageFlagsSet(String(uid), ['\\Seen'], { uid: true, action: 'add' });
 
       let archived = false;
       if (archive) {
-        // Remove from INBOX = set the \Deleted flag and expunge.
-        // Gmail treats expunge as "archive" (removes the INBOX label).
         await client.messageFlagsSet(String(uid), ['\\Deleted'], { uid: true, action: 'add' });
         await client.expunge({ byUid: true, uids: [String(uid)] });
         archived = true;
@@ -326,18 +350,12 @@ export function startPoller({ onNewMessage, intervalMin = POLL_MIN } = {}) {
 
   const seen = loadSeen();
   let running = false;
-  // Track the last successful poll timestamp so the background poller
-  // never re-pulls old starred mail. Manual scans are still allowed to
-  // override the window via the API.
   let lastPollAt = new Date(Date.now() - 24 * 60 * 60 * 1000);
 
   const tick = async () => {
     if (running) return;
     running = true;
     try {
-      // The poller is constrained to "since last successful poll" to avoid
-      // re-fetching the same starred messages every 5 minutes. This is a
-      // tighter window than the manual scan's 24h default.
       const since = lastPollAt;
       const msgs = await fetchUnread({ since, includeStarred: true, limit: 50 });
       const fresh = msgs.filter((m) => !seen.has(m.messageId));
@@ -359,7 +377,6 @@ export function startPoller({ onNewMessage, intervalMin = POLL_MIN } = {}) {
     }
   };
 
-  // First tick after 10s (let server fully boot)
   setTimeout(tick, 10_000);
   const handle = setInterval(tick, intervalMin * 60 * 1000);
   return () => clearInterval(handle);

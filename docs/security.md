@@ -46,3 +46,29 @@ Dashboard exposes only safe cron summaries: job name, enabled flag, last status,
 ## Output escaping
 
 Printable invoice HTML escapes user/customer-controlled fields before rendering.
+
+## Email HTML safety
+
+Imported Gmail HTML (`ticket_messages.body_html`) is sanitized on write by `sanitizeEmailHtml` in `server/lib/attachments.js`:
+
+- Strips `<script>`, `<style>`, `<iframe>`, `<object>`, `<embed>`, `<link>`, `<meta>`, `<base>`, `<form>`.
+- Strips `on*` event-handler attributes (`onclick`, `onload`, `onerror`, …).
+- Strips `javascript:` URLs from `href` and `src` (rewrites them to `#`).
+- Adds `rel="noopener noreferrer"` to any `<a>` with `href` but no `rel`.
+- Rewrites `cid:` image references to `/api/attachments/:id/raw` so inline images render through our raw-bytes endpoint, not by trusting third-party content URLs.
+
+Output is rendered inside a sandboxed iframe in the React UI (`EmailBody` component) with `sandbox="allow-same-origin"` and no `allow-scripts` — script execution is impossible even if the sanitizer is bypassed. This is defense in depth: the sanitizer strips the obvious vectors, the sandbox catches the rest.
+
+The sanitizer is small and intentional. It is **not** a replacement for DOMPurify; it is a fast deterministic scrubber for the admin-only Tailscale-protected surfaces (inbox preview + ticket page). The threat model is "a customer's email contains content the admin will see in a local browser," not "an untrusted remote origin." Do not relax either the sanitizer or the sandbox.
+
+## Outbound email signature
+
+The `email_signature` setting is **plain text only** by design. The signature is HTML-escaped on render (`<` → `&lt;`, etc.) and rendered inside a `<div style="white-space:pre-wrap">…</div>` so newlines survive without `<br>` injection. The customer's reply text is also HTML-escaped before being concatenated.
+
+This is intentional. Even though the signature is admin-authored, allowing HTML in the signature creates an injection surface: a future "rich signature" field would need a stricter sanitizer, and any signature update would need to be re-escaped. Plain text + escape is simpler, safer, and matches the actual content Byron needs (name, business, contact info).
+
+## Reply-merge + mark-read safety
+
+The reply matcher (`lib/replies.js`) only matches open tickets for the **same customer** (matched by email). It does not move a message from one customer's ticket to another customer's ticket, even if subject lines collide. Matchers that conflate across customers would be a privacy / impersonation hazard; the current implementation prevents that.
+
+The "mark read" call (`markImportedRead` → `imapflow` `\Seen`) is best-effort and never throws. It runs after a successful import (new or merged) so the Gmail inbox stays in sync with the dashboard. It does **not** archive, so the message remains in the customer's Gmail thread for their reference.

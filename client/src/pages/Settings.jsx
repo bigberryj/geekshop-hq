@@ -147,6 +147,18 @@ export default function Settings() {
       </section>
 
       <section className="card mb-4">
+        <h3 className="font-semibold mb-3">Outbound email signature</h3>
+        <p className="text-xs text-slate-500 mb-3">
+          Appended to every ticket reply sent to a customer ("Email customer" and "Reply &amp; resolve").
+          Plain text only — newlines preserved. Leave empty to disable.
+        </p>
+        <SignatureField
+          value={settings.email_signature || ''}
+          onSave={(v) => update('email_signature', v)}
+        />
+      </section>
+
+      <section className="card mb-4">
         <h3 className="font-semibold mb-3">AI provider (two-tier)</h3>
         <p className="text-xs text-slate-500 mb-3">High-reasoning tasks (reply drafts, summary, extraction) use the provider below. Cheap/fast tasks (classification, nudges) use the other.</p>
         <div className="grid grid-cols-2 gap-4">
@@ -221,6 +233,38 @@ function ListField({ label, hint, value, onSave }) {
         <button className="btn-secondary" onClick={() => onSave(v)}>Save</button>
       </div>
       {hint && <p className="text-xs text-slate-500 mt-1">{hint}</p>}
+    </div>
+  );
+}
+
+function SignatureField({ value, onSave }) {
+  const [v, setV] = useState(value || '');
+  useEffect(() => { setV(value || ''); }, [value]);
+  const commit = () => onSave(v);
+  const sample = `Hi Linda — coming out tomorrow to assess the firewall. I have a 10am-11:30am slot open if that works.`;
+  const preview = v.trim() ? `${sample}\n\n--\n${v}` : sample;
+  return (
+    <div className="max-w-2xl">
+      <label className="label">Signature (plain text)</label>
+      <textarea
+        className="input font-mono text-xs"
+        rows={5}
+        value={v}
+        onChange={(e) => setV(e.target.value)}
+        onBlur={commit}
+        placeholder={'Byron Berry\nGeekShop Computers\nbyron@geekshop.ca · 250-555-0100'}
+      />
+      <div className="flex gap-2 mt-2">
+        <button className="btn-secondary" onClick={commit}>Save</button>
+        <span className="self-center text-xs text-slate-500">Saves on blur or button click.</span>
+      </div>
+      <div className="mt-3">
+        <div className="text-xs text-slate-500 mb-1">Live preview (sample reply + your signature):</div>
+        <pre
+          className="text-xs bg-slate-50 border border-slate-200 rounded p-3 whitespace-pre-wrap font-mono"
+          data-testid="signature-preview"
+        >{preview}</pre>
+      </div>
     </div>
   );
 }

@@ -1,7 +1,27 @@
 import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
-import { fetchJson, postJson, formatDuration } from '../lib/api.js';
-import { Sparkles, Send, CheckCircle, Play, Square, RotateCw } from 'lucide-react';
+import { fetchJson, postJson } from '../lib/api.js';
+import { Sparkles, Send, CheckCircle, Play, Square, Pause, RotateCw } from 'lucide-react';
+import EmailBody from '../components/EmailBody.jsx';
+
+function formatTimerDuration(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return [h, m, s].map((part) => String(part).padStart(2, '0')).join(':');
+}
+
+function parseDbTimestamp(value) {
+  if (!value) return NaN;
+  if (typeof value !== 'string') return new Date(value).getTime();
+  // SQLite CURRENT_TIMESTAMP returns UTC as "YYYY-MM-DD HH:mm:ss" without a
+  // timezone. Browsers treat that as local time, so force UTC before math.
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(value)
+    ? `${value.replace(' ', 'T')}Z`
+    : value;
+  return new Date(normalized).getTime();
+}
 
 export default function TicketDetail() {
   const { id } = useParams();
@@ -10,10 +30,24 @@ export default function TicketDetail() {
   const [originalDraft, setOriginalDraft] = useState(''); // for feedback diff
   const [reply, setReply] = useState('');
   const [busy, setBusy] = useState(false);
+  const [timerBusy, setTimerBusy] = useState(false);
   const [error, setError] = useState('');
+  const [timeEntries, setTimeEntries] = useState([]);
+  const [clockTick, setClockTick] = useState(Date.now());
 
-  const load = () => fetchJson(`/tickets/${id}`).then(setTicket);
+  const load = async () => {
+    const [ticketData, timeData] = await Promise.all([
+      fetchJson(`/tickets/${id}`),
+      fetchJson(`/tickets/${id}/time`),
+    ]);
+    setTicket(ticketData);
+    setTimeEntries(timeData);
+  };
   useEffect(() => { load(); }, [id]);
+  useEffect(() => {
+    const timer = setInterval(() => setClockTick(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   if (!ticket) return <div>Loading…</div>;
 
@@ -94,14 +128,25 @@ export default function TicketDetail() {
     try { await postJson(`/tickets/${id}/resolve`, {}); load(); } finally { setBusy(false); }
   };
 
-  const toggleTimer = async () => {
-    const running = ticket.messages && false;  // simplification; real impl reads from /tickets/:id/time
-    setBusy(true);
+  const activeTimer = timeEntries.find((entry) => !entry.stopped_at) || null;
+  const elapsedSeconds = (() => {
+    if (!activeTimer) return 0;
+    const base = Number(activeTimer.duration_seconds ?? activeTimer.elapsed_seconds ?? 0);
+    if (activeTimer.status !== 'running') return base;
+    const startedAt = parseDbTimestamp(activeTimer.started_at);
+    if (Number.isNaN(startedAt)) return Number(activeTimer.elapsed_seconds ?? base);
+    return Math.max(0, Math.floor(base + ((clockTick - startedAt) / 1000)));
+  })();
+
+  const timerAction = async (action) => {
+    setTimerBusy(true);
+    setError(null);
     try {
-      if (running) await postJson(`/tickets/${id}/time/stop`, {});
-      else await postJson(`/tickets/${id}/time/start`, {});
-      load();
-    } finally { setBusy(false); }
+      await postJson(`/tickets/${id}/time/${action}`, {});
+      await load();
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally { setTimerBusy(false); }
   };
 
   return (
@@ -135,9 +180,36 @@ export default function TicketDetail() {
         <div className="flex items-center gap-2">
           <span className={`badge-${ticket.priority === 'urgent' ? 'red' : 'slate'}`}>{ticket.priority}</span>
           <span className={`badge-${ticket.status === 'open' ? 'green' : 'slate'}`}>{ticket.status}</span>
-          <button className="btn-secondary" onClick={toggleTimer} disabled={busy}>
-            <Play size={14} /> Start timer
-          </button>
+          {activeTimer && (
+            <div className="flex items-center gap-2 rounded border border-slate-200 bg-white px-3 py-2 text-sm" data-testid="ticket-timer-panel">
+              <span className="font-mono font-semibold tabular-nums" data-testid="ticket-timer-elapsed">
+                {formatTimerDuration(elapsedSeconds)}
+              </span>
+              <span className={`badge-${activeTimer.status === 'running' ? 'green' : 'yellow'}`} data-testid="ticket-timer-status">
+                {activeTimer.status}
+              </span>
+            </div>
+          )}
+          {!activeTimer && (
+            <button className="btn-secondary" onClick={() => timerAction('start')} disabled={timerBusy} data-testid="start-timer-button">
+              <Play size={14} /> Start timer
+            </button>
+          )}
+          {activeTimer?.status === 'running' && (
+            <button className="btn-secondary" onClick={() => timerAction('pause')} disabled={timerBusy} data-testid="pause-timer-button">
+              <Pause size={14} /> Pause
+            </button>
+          )}
+          {activeTimer?.status === 'paused' && (
+            <button className="btn-secondary" onClick={() => timerAction('resume')} disabled={timerBusy} data-testid="resume-timer-button">
+              <RotateCw size={14} /> Resume
+            </button>
+          )}
+          {activeTimer && (
+            <button className="btn-secondary" onClick={() => timerAction('stop')} disabled={timerBusy} data-testid="stop-timer-button">
+              <Square size={14} /> Stop
+            </button>
+          )}
           {ticket.status !== 'resolved' && (
             <button className="btn-primary" onClick={resolve} disabled={busy}>
               <CheckCircle size={14} /> Mark resolved
@@ -170,7 +242,7 @@ export default function TicketDetail() {
                 {m.ai_draft ? ' · (AI draft)' : ''}
                 {' · '}{new Date(m.created_at).toLocaleString()}
               </div>
-              <div className="text-sm whitespace-pre-wrap">{m.body}</div>
+              <EmailBody body={m.body} body_html={m.body_html} attachments={m.attachments || []} />
             </div>
           ))}
         </div>
