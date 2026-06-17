@@ -5,7 +5,7 @@ status: executed
 category: docs/plans
 slug: 2026-06-17-gmail-import-merge-and-signature
 last_executed: 2026-06-17
-final_commit: pending
+final_commit: b9ac6064bde78fa55944f4dd19f06140a68e3ab5
 solution_doc: docs/solutions/build-it/geekshop-hq-import-merge-and-signature-iteration.md
 ---
 
