@@ -1,5 +1,50 @@
 # Changelog
 
+## 2026-06-17 — Mission Control: silent-on-no-op delivery
+
+The Mission Control worker was delivering its own cron failure reports to
+Telegram every 2 min because the cron's `deliver` target was `telegram` and
+the upstream model was being rate-limited (HTTP 429). That was wrong on two
+counts: a 2-min tick should not auto-spam, and the 429 is an infrastructure
+problem, not a per-task failure.
+
+### Changes
+
+- **Cron `deliver` target changed to `local`.** The worker itself decides
+  whether to send a Telegram ping, and the gateway only delivers when the
+  worker's final response is not the literal `[SILENT]`.
+- **Empty queue → `[SILENT]`.** No more "queue empty" pings.
+- **Rate-limit (429) → `[SILENT]` + cooldown stamp.** The worker writes
+  `~/.hermes/state/agent-task-worker/rate_limited_until` (epoch 15 min in
+  the future) on the first 429, and `preflight.sh` reads it on every
+  subsequent tick to short-circuit before the LLM even gets called. A
+  pending task in `running` state with no heartbeat is left alone — the
+  stuck-requeue sweep on the next tick will requeue it (or fail it if
+  `attempts >= max_attempts`).
+- **`preflight.sh`** (`server/scripts/agent-task-worker/preflight.sh`):
+  runs the stuck-requeue sweep, checks the cooldown stamp, and prints
+  `OK` or `RATE_LIMITED`. The worker prompt calls it as step 1.
+- **Renamed** the cron from `GeekShop agent task worker` to
+  `Mission Control worker` to make the scope clear in `hermes cron list`.
+
+### Verified
+
+- Two forced ticks: 0 Telegram sends (confirmed via `journalctl`), 1 local
+  output file each (audit trail only). The 429 still happens because the
+  upstream is still throttled, but it's invisible to the user.
+- Manual `preflight.sh` test: `OK` normally, `RATE_LIMITED` with a stamp.
+
+### What you will and won't see in Telegram
+
+| Case | Telegram |
+|---|---|
+| Empty queue | nothing |
+| 429 rate-limited | nothing |
+| Stuck-requeue only | nothing |
+| Real work, all criteria pass | one `[J5][agent-task] <uid> → review` ping |
+| Real work, some criteria fail | one `[J5][agent-task][BLOCKED] <uid> → blocked` ping |
+| Worker exception | one `[J5][agent-task][FAILED] <uid> → failed` ping |
+
 ## 2026-06-17 — Mission Control: durable task queue + worker + UI
 
 The "I asked J5 to do something and need to know if it's actually done" loop, end-to-end. Durable queue, self-reviewing worker cron, real-time HQ page, Telegram bridge.
@@ -17,7 +62,8 @@ The "I asked J5 to do something and need to know if it's actually done" loop, en
 - **Mission Control UI** (`/mission-control`): live-polling table (5s) with summary cards, status filter pills, and a side drawer showing the original ask, worker's `result_summary`, self-review checklist (✓/✗ icons), timestamps, and Approve / Send-back / Cancel buttons. New entry in the sidebar nav (Bot icon).
 - **Worker CLI** (`server/scripts/agent-task-worker/agent-task-cli.js`): atomic `claim`, `heartbeat`, `finish` / `mark-review` / `mark-blocked` / `mark-failed`, `stuck-requeue`. The CLI prints `NO_TASK` when the queue is empty so the worker prompt can short-circuit cleanly.
 - **Enqueue CLI** (`server/scripts/agent-task-worker/enqueue-task.js`): one-liner to enqueue from the terminal (stdin or argv) with `source` / `priority` / `source_ref` flags. Used by the session-level Telegram bridge.
-- **Worker cron** (`GeekShop agent task worker`, every 2 min, deliver to Telegram): reads the operating manual at `server/scripts/agent-task-worker/WORKER_PROMPT.md` on every tick, runs the stuck-requeue sweep, claims the next task, does the work, self-reviews, transitions to `review` or `blocked`, and pings Byron on Telegram with a `[J5][agent-task] <uid> → <status>` summary + checklist.
+- **Worker cron** (`Mission Control worker`, every 2 min, deliver to Telegram): reads the operating manual at `server/scripts/agent-task-worker/WORKER_PROMPT.md` on every tick, runs the stuck-requeue sweep, claims the next task, does the work, self-reviews, transitions to `review` or `blocked`, and pings Byron on Telegram with a `[J5][agent-task] <uid> → <status>` summary + checklist.
+  - **Delivery discipline (v2):** the cron's `deliver` target is `local`. The worker itself decides whether to send a Telegram ping. Empty queue, rate-limit cooldown, and stuck-requeue-only paths all return `[SILENT]` and produce no message. Real work produces exactly one ping. `preflight.sh` runs the stuck-requeue sweep and reads the `rate_limited_until` stamp at the start of every tick.
 - **Telegram → queue bridge** (v1, session-level): typing `queue <description>` in the `@john5wizbot` chat enqueues a task. (Telegram-bus polling not wired in v1 — that needs a gateway hook; the session-level path gives the same UX with no gateway modification.)
 - **19 new unit tests** for `lib/agent-tasks.js` (claim atomicity, heartbeat, finish state-guards, decide state-machine, stuck-requeue with max-attempts, list ordering, summary counts). All 185/185 tests pass.
 - **Docs:** `docs/schema.md` (table + ER diagram), `docs/api.md` (full endpoint reference), `docs/architecture.md` (data flow + Telegram bridge), `docs/security.md` (blast radius, what the worker cannot do, input validation, stuck-task requeue, dashboard projection).
