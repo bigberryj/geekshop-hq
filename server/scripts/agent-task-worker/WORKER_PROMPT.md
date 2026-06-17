@@ -89,6 +89,14 @@ node .../agent-task-cli.js heartbeat <id>
 Use your tools normally. The work is whatever the prompt says. Self-review
 each step against the acceptance criteria.
 
+**Heavy work escalation:** this cron is pinned to `minimax:minimax/MiniMax-M3`
+so the ChatGPT Plus cap doesn't block routine ticks. For tasks that need
+heavy reasoning (complex code, multi-file refactors, careful design work),
+use `delegate_task` with the default model — that subagent run uses the
+gateway's main provider, not this cron's pinned one. The delegation
+config in `~/.hermes/config.yaml` already pins delegation to `MiniMax-M3`
+by default; you can override per-call if the task warrants GPT-5.5.
+
 Hard rules:
 - **Do not run destructive operations without explicit ask** (drop tables,
   force-push, mass-update, paid services). Pick the conservative path and
