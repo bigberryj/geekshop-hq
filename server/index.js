@@ -63,6 +63,22 @@ export async function buildServer(opts = {}) {
   const db = await runMigrations(dbPath);
   app.decorate('db', db);
 
+  // Wire the agent-tasks lib to broadcast activity through the SSE
+  // channel (or no-op if no listeners are attached). Also keep a small
+  // ring buffer for /api/activity/recent.
+  app.decorate('_sseSubscribers', new Map());
+  app.decorate('_activityBuffer', []);
+  app.decorate('broadcastActivity', (event) => {
+    const tagged = { ...event, at: event.at || new Date().toISOString() };
+    if (app._activityBuffer.length >= 200) app._activityBuffer.shift();
+    app._activityBuffer.push(tagged);
+    for (const [, res] of app._sseSubscribers) {
+      try { res.write(`data: ${JSON.stringify(tagged)}\n\n`); } catch { /* connection closed */ }
+    }
+  });
+  const { setActivitySink } = await import('./lib/agent-tasks.js');
+  setActivitySink((event) => app.broadcastActivity(event));
+
   await registerRoutes(app, { rootDir });
 
   // Best-effort SMTP verify; never block boot

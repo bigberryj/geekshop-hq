@@ -12,6 +12,8 @@ import Memory from './pages/Memory.jsx';
 import Settings from './pages/Settings.jsx';
 import PublicBooking from './pages/PublicBooking.jsx';
 import MissionControl from './pages/MissionControl.jsx';
+import Agents from './pages/Agents.jsx';
+import Feed from './pages/Feed.jsx';
 
 export default function App() {
   return (
@@ -29,6 +31,8 @@ export default function App() {
         <Route path="memory" element={<Memory />} />
         <Route path="settings" element={<Settings />} />
         <Route path="mission-control" element={<MissionControl />} />
+        <Route path="mission-control/agents" element={<Agents />} />
+        <Route path="mission-control/feed" element={<Feed />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>
     </Routes>

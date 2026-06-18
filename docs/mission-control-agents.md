@@ -1,0 +1,116 @@
+# Mission Control — Agents & Live Feed
+
+Mission Control now has three tabs:
+
+| Tab | Path | Purpose |
+|---|---|---|
+| **Tasks** | `/mission-control` | Existing task list with the drawer for approve/requeue/cancel/reopen |
+| **Agents** | `/mission-control/agents` | Roster of gateways + specialist profiles + chat panel for addressable gateways |
+| **Live** | `/mission-control/feed` | Real-time activity feed (SSE) of task transitions and chat sends |
+
+## What the Agents page shows
+
+The Agents page introspects the running Hermes infrastructure on this machine:
+
+- **Worker cron card** at the top — shows whether the HQ task-claimer is active, with running / review / queued counts and the timestamp of the last heartbeat / claim.
+- **Gateways** (live `hermes gateway run` processes) — one card per process, with:
+  - Model + provider
+  - Live / stopped indicator
+  - PID, uptime, Telegram handle
+  - "Open chat" button (only if a Telegram bot token is configured for that profile)
+- **Specialist profiles** (6 of them: `coder`, `scout`, `glm51`, `qwen35`, `reasoner`, `reviewer`) — read-only cards showing the model and stopped status. These are **not addressable**: clicking them does nothing. They're configurations Johnny5 spawns via the `specialist-routing` skill, not separate agents with their own chat.
+
+The roster auto-refreshes every 15 seconds.
+
+## Addressability
+
+Only **gateways with a Telegram bot configured** can be messaged from Mission Control. The reason: Telegram is the only chat channel that gateways actually have. A "specialist profile" is just a model config — there's no separate Telegram bot, no separate process to talk to.
+
+The chat panel first checks HQ env vars, then reuses the existing Hermes gateway env files without copying secrets:
+
+- default gateway: `$HOME/.hermes/.env`
+- minimax gateway: `$HOME/.hermes/profiles/minimax/.env`
+
+So if Byron already configured `TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` for the gateways, Mission Control can send without duplicating secrets into `server/.env`. Explicit HQ vars (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, or per-profile overrides) still win if set. The default handles are hardcoded for `default` (`@john5wizbot`) and `minimax` (`@john5minimaxbot`); override via `TELEGRAM_BOT_HANDLE_DEFAULT` / `TELEGRAM_BOT_HANDLE_MINIMAX` if needed.
+
+## API surface
+
+```
+GET    /api/agents                        # full roster (gateways + profiles + worker_cron)
+GET    /api/agents/:id                    # single agent detail
+GET    /api/agents/:id/messages           # recent chat history (Telegram getUpdates, last 20)
+POST   /api/agents/:id/messages           # send a message to the agent's Telegram bot
+GET    /api/activity/stream               # SSE feed of all task transitions + chat sends
+GET    /api/activity/recent?limit=N       # non-streaming ring buffer (max 200 events)
+```
+
+### POST /api/agents/:id/messages
+
+```json
+// request
+{ "text": "Hey Johnny5, can you summarize the latest dtbc evidence?" }
+
+// response (200)
+{
+  "ok": true,
+  "message_id": 12345,
+  "chat_id": 987654321,
+  "sent_at": "2026-06-18T20:15:30.000Z"
+}
+
+// response (502 — Telegram not configured)
+{ "error": "TELEGRAM_BOT_TOKEN not configured" }
+```
+
+The response also fires an SSE event (`kind: "agent_message_sent"`) so the Live feed updates without polling.
+
+### SSE event kinds
+
+| Kind | When | Payload |
+|---|---|---|
+| `task_claimed` | worker picked up a queued task | `{ task: {id, uid, title, ...} }` |
+| `task_finished` | worker marked a task `done` / `failed` / `review` / `blocked` | `{ task, status }` |
+| `task_decided` | you approved / requeued / cancelled a task | `{ task, action }` |
+| `task_reopened` | you reopened a terminal task | `{ task }` |
+| `agent_message_sent` | you sent a message to an agent | `{ agent_id, message_id, text_preview }` |
+| `task_snapshot` | SSE initial connect — running/review/queued tasks | `{ task }` |
+
+## Environment variables
+
+```bash
+# Optional. Token used for all gateways unless overridden per-profile.
+# If unset, HQ falls back to the existing Hermes gateway env files.
+# TELEGRAM_BOT_TOKEN=123456...
+
+# Chat ID / home channel. If unset, HQ falls back to TELEGRAM_HOME_CHANNEL
+# in the existing Hermes gateway env files.
+# TELEGRAM_CHAT_ID=987654321
+
+# Per-profile overrides. Useful if you want a different bot for each gateway.
+# TELEGRAM_BOT_TOKEN_DEFAULT=...
+# TELEGRAM_BOT_TOKEN_MINIMAX=...
+# TELEGRAM_CHAT_ID_DEFAULT=...
+# TELEGRAM_CHAT_ID_MINIMAX=...
+
+# Display handles (cosmetic — what the UI shows).
+# TELEGRAM_BOT_HANDLE_DEFAULT=@john5wizbot
+# TELEGRAM_BOT_HANDLE_MINIMAX=@john5minimaxbot
+```
+
+If these are unset, the chat panel still renders but the **Send** button returns `502 TELEGRAM_BOT_TOKEN not configured`. The rest of Mission Control works without Telegram credentials.
+
+## Local-only addresses
+
+The Mission Control API (including `/api/agents/:id/messages`) is admin-only:
+- bound to `HOST=0.0.0.0` but
+- only callable from `127.0.0.1`, the LAN (`192.168.x.x`), or Tailscale (`100.x.x.x`)
+- not exposed publicly
+
+Telegram itself is a third-party service, so the chat feature transitively reaches `api.telegram.org` from bigbai. That's the same path your existing Codex / MiniMax gateways already use.
+
+## Open followups
+
+- **Bulk actions** on the task list (multi-select reopen / cancel) — not built. Add to MissionControl.jsx with checkbox + a "Bulk action" button when N items selected.
+- **Reply streaming.** Right now the chat panel polls `getUpdates` every 3s and shows up to 20 messages. Better UX: subscribe to a webhook on the bot and push incoming messages to the open panel via the SSE feed.
+- **Direct miniMax + j5minimaxbot typing indicators** in the panel — minor polish.
+- **Filter chips** on the task list (source: telegram/hq_ui/email/voice/seed, agent: minimax/default, priority) — useful when the queue grows.

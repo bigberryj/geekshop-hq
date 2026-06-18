@@ -23,6 +23,20 @@
 
 import { randomBytes } from 'node:crypto';
 
+/**
+ * Activity broadcast hook. Wired up by the route layer in server/index.js
+ * (or routes/agents.js) so this lib stays free of HTTP concerns. Falls
+ * back to a no-op so the lib remains usable from CLI contexts (e.g.
+ * `agent-task-cli.js`) where no app is present.
+ */
+let _activitySink = null;
+export function setActivitySink(fn) { _activitySink = fn; }
+
+function emit(event) {
+  if (!_activitySink) return;
+  try { _activitySink(event); } catch { /* never let a broadcast failure break a task transition */ }
+}
+
 const SAFE_STATUSES = new Set([
   'queued', 'running', 'review', 'blocked', 'failed', 'done', 'cancelled',
 ]);
@@ -119,7 +133,9 @@ export function claimNextTask(db, { now = new Date().toISOString() } = {}) {
          AND status IN ('queued', 'requeued')
     `).run(now, now, row.id);
     if (updated.changes === 0) return null; // someone else claimed it
-    return getTask(db, row.id);
+    const task = getTask(db, row.id);
+    emit({ kind: 'task_claimed', task });
+    return task;
   })();
 }
 
@@ -214,6 +230,9 @@ export function finishTask(db, id, patch) {
       }
     });
   }
+  if (result.changes > 0) {
+    emit({ kind: 'task_finished', task: getTask(db, id), status: patch.status });
+  }
   return result.changes > 0;
 }
 
@@ -286,9 +305,11 @@ export function decideTask(db, id, { action, note, decided_by = 'byron' } = {}) 
         }
       });
     }
+    if (updated) emit({ kind: 'task_decided', task: updated, action });
     return updated;
   })();
 }
+
 
 /**
  * Stuck-detector: tasks in `running` whose last heartbeat is older than
@@ -460,6 +481,8 @@ export function reopenTask(db, id, { note = '', decided_by = 'byron' } = {}) {
        WHERE id = ?
     `).run(new_summary, id);
 
-    return getTask(db, id);
+    const reopened = getTask(db, id);
+    if (reopened) emit({ kind: 'task_reopened', task: reopened });
+    return reopened;
   })();
 }

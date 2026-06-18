@@ -17,6 +17,7 @@ import { authRoutes } from './auth.js';
 import { bookingRoutes } from './booking.js';
 import { inboxRoutes } from './inbox.js';
 import { agentTaskRoutes } from './agent-tasks.js';
+import agentRoutes from './agents.js';
 
 export async function registerRoutes(app, { rootDir }) {
   // Health check
@@ -37,4 +38,5 @@ export async function registerRoutes(app, { rootDir }) {
   await app.register(bookingRoutes);
   await app.register(inboxRoutes);
   await app.register(agentTaskRoutes);
+  await app.register(agentRoutes);
 }

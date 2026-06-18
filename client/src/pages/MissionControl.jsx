@@ -1,4 +1,5 @@
 import { useEffect, useState, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
 import { fetchJson, postJson } from '../lib/api.js';
 import {
   Activity, Bot, Check, ChevronDown, ChevronUp, Clock, ExternalLink,
@@ -200,6 +201,7 @@ function TaskDrawer({ taskId, onClose, onChanged }) {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [note, setNote] = useState('');
+  const [reopenNote, setReopenNote] = useState('');
   const [acting, setActing] = useState(false);
 
   const load = useCallback(async () => {
@@ -223,6 +225,20 @@ function TaskDrawer({ taskId, onClose, onChanged }) {
       const updated = await postJson(`/agent-tasks/${taskId}/decision`, { action, note });
       setTask(updated);
       setNote('');
+      onChanged?.(updated);
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setActing(false);
+    }
+  };
+
+  const reopen = async () => {
+    setActing(true);
+    try {
+      const updated = await postJson(`/agent-tasks/${taskId}/reopen`, { note: reopenNote });
+      setTask(updated);
+      setReopenNote('');
       onChanged?.(updated);
     } catch (e) {
       setError(e.response?.data?.error || e.message);
@@ -341,6 +357,23 @@ function TaskDrawer({ taskId, onClose, onChanged }) {
               </section>
             )}
 
+            {(task.status === 'done' || task.status === 'failed' || task.status === 'cancelled') && (
+              <section className="border-t pt-4 space-y-2">
+                <h4 className="font-medium text-sm">Reopen</h4>
+                <p className="text-xs text-slate-500">
+                  This task is terminal. Reopen to reset it to <span className="font-mono">queued</span> so the worker cron can claim it again on the next tick.
+                </p>
+                <textarea className="input min-h-[60px]" placeholder="Why are you reopening? (goes on the task record)"
+                          value={reopenNote} onChange={(e) => setReopenNote(e.target.value)} />
+                <div className="flex gap-2">
+                  <button className="btn-secondary" disabled={acting}
+                          onClick={reopen}>
+                    <RotateCcw size={14} /> Reopen
+                  </button>
+                </div>
+              </section>
+            )}
+
             {task.decision && (
               <section className="text-xs text-slate-600 border-t pt-3">
                 <p>Decision: <span className="font-mono">{task.decision}</span> by {task.decided_by || '?'} at {task.decided_at}</p>
@@ -444,6 +477,12 @@ export default function MissionControl() {
           </button>
         </div>
       </div>
+
+      <nav className="flex gap-4 border-b border-slate-200 mb-4 text-sm">
+        <Link to="/mission-control" className="pb-2 border-b-2 border-brand-600 text-brand-700 font-medium">Tasks</Link>
+        <Link to="/mission-control/agents" className="pb-2 border-b-2 border-transparent text-slate-500 hover:text-slate-800">Agents</Link>
+        <Link to="/mission-control/feed" className="pb-2 border-b-2 border-transparent text-slate-500 hover:text-slate-800">Live</Link>
+      </nav>
 
       {summary && (
         <div className="grid grid-cols-2 md:grid-cols-7 gap-2 mb-4">
