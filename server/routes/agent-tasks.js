@@ -8,6 +8,13 @@
  *   GET    /api/agent-tasks/:id                   full task (incl. prompt + review)
  *   POST   /api/agent-tasks/:id/decision          approve / requeue / cancel
  *   POST   /api/agent-tasks/:id/requeue           explicit requeue with note
+ *   POST   /api/agent-tasks/:id/reopen            reopen a done/cancelled task so the
+ *                                                 worker cron will pick it up again.
+ *                                                 Resets finished_at, decision*, attempts.
+ *                                                 Adds a reopen_note explaining why.
+ *                                                 Use sparingly — every "I want to continue
+ *                                                 this work" should create a child task with
+ *                                                 a continuation prompt instead.
  *
  * Auth: same model as the rest of the HQ API. Until the auth middleware
  * is wired, this surface is treated as admin-only (loopback / LAN /
@@ -30,6 +37,7 @@ import {
   listTasks,
   decideTask,
   summarizeTasks,
+  reopenTask,
 } from '../lib/agent-tasks.js';
 
 const PROMPT_MAX = 32 * 1024;
@@ -127,6 +135,35 @@ export async function agentTaskRoutes(app) {
     const updated = decideTask(app.db, id, { action: 'requeue', note });
     if (!updated) {
       return reply.code(409).send({ error: 'task is not in a decidable state' });
+    }
+    return getTaskForReview(app.db, id);
+  });
+
+  /**
+   * POST /api/agent-tasks/:id/reopen
+   *
+   * Reopen a terminal task (done/failed/cancelled). Resets finished_at,
+   * decision*, attempts back to 0, and appends the optional note to
+   * result_summary so the worker cron (and Byron) can see why it was
+   * reopened. Worker cron will claim it on its next tick.
+   *
+   * Body: { note?: string, decided_by?: string }
+   *
+   * Use sparingly. Prefer creating a child task with a continuation
+   * prompt over reopening, so history stays linear. Reopen is the right
+   * answer when the original task was approved by mistake (or approved
+   * while the work was still incomplete and you want to retry the same
+   * prompt as-is).
+   */
+  app.post('/api/agent-tasks/:id/reopen', async (req, reply) => {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) return badRequest(reply, 'invalid id');
+    const body = req.body || {};
+    const note = typeof body.note === 'string' ? body.note : '';
+    const decided_by = typeof body.decided_by === 'string' ? body.decided_by : 'byron';
+    const updated = reopenTask(app.db, id, { note, decided_by });
+    if (!updated) {
+      return reply.code(409).send({ error: 'task is not in a terminal state (done/failed/cancelled) — cannot reopen' });
     }
     return getTaskForReview(app.db, id);
   });

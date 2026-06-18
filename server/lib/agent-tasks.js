@@ -187,6 +187,33 @@ export function finishTask(db, id, patch) {
     now,
     id,
   );
+  // Fire-and-forget notification. We re-fetch the row so the email body
+  // reflects the final committed state (decision, finished_at, etc.).
+  // IMPORTANT: open a fresh DB connection here — the caller's connection
+  // may already be closed by the time setImmediate runs (especially in
+  // the CLI script, which closes its connection right after finishTask
+  // returns). Errors are swallowed inside notify.js; nothing here should
+  // ever throw.
+  if (result.changes > 0) {
+    setImmediate(async () => {
+      try {
+        const { notifyTaskTerminal } = await import('./notify.js');
+        // Re-open a fresh connection for the post-commit read.
+        const Database = (await import('better-sqlite3')).default;
+        const { getTask } = await import('./agent-tasks.js');
+        const path = process.env.HQ_DB_PATH || '/home/byron/projects/geekshop-hq/data/hq.db';
+        const freshDb = new Database(path);
+        try {
+          const fresh = getTask(freshDb, id);
+          if (fresh) await notifyTaskTerminal(fresh);
+        } finally {
+          freshDb.close();
+        }
+      } catch (err) {
+        console.error(`[notify] finishTask hook for #${id} crashed: ${err.message}`);
+      }
+    });
+  }
   return result.changes > 0;
 }
 
@@ -244,7 +271,22 @@ export function decideTask(db, id, { action, note, decided_by = 'byron' } = {}) 
       now,
       id,
     );
-    return getTask(db, id);
+    const updated = getTask(db, id);
+    // Fire-and-forget notification for decide transitions that produce a
+    // terminal or near-terminal status (done/cancelled are terminal; requeue
+    // lands back in queued so we don't notify on that one).
+    // Same fresh-connection pattern as finishTask — caller's db may be gone.
+    if (updated && (updated.status === 'done' || updated.status === 'cancelled')) {
+      setImmediate(async () => {
+        try {
+          const { notifyTaskTerminal } = await import('./notify.js');
+          await notifyTaskTerminal(updated);
+        } catch (err) {
+          console.error(`[notify] decideTask hook for #${id} crashed: ${err.message}`);
+        }
+      });
+    }
+    return updated;
   })();
 }
 
@@ -371,4 +413,53 @@ export function summarizeTasks(db) {
     out.total += r.n;
   }
   return out;
+}
+
+/**
+ * Reopen a task that's in a terminal state (done / failed / cancelled).
+ * Resets finished_at, decision*, last_error, attempts. Status moves to
+ * 'queued' so the worker cron will claim it on its next tick.
+ *
+ * The optional `note` is appended to result_summary with a clear
+ * separator so the worker's next claim sees why it was reopened.
+ * `decided_by` defaults to 'byron'.
+ *
+ * Returns the updated row on success, null if the task isn't in a
+ * terminal state (or doesn't exist).
+ *
+ * Notes on idempotency: this is intentionally NOT a state-machine
+ * validator — it accepts any terminal status and forces the transition.
+ * The route layer is responsible for refusing reopen on non-terminal
+ * tasks (so we don't accidentally lose an in-flight worker).
+ */
+export function reopenTask(db, id, { note = '', decided_by = 'byron' } = {}) {
+  return db.transaction(() => {
+    const task = getTask(db, id);
+    if (!task) return null;
+    if (!['done', 'failed', 'cancelled'].includes(task.status)) return null;
+
+    const reopen_note = note ? `\n\n[REOPENED ${new Date().toISOString()} by ${decided_by}] ${note}` : '';
+    const existing_summary = task.result_summary || '';
+    const new_summary = existing_summary + reopen_note;
+
+    db.prepare(`
+      UPDATE agent_tasks
+         SET status        = 'queued',
+             finished_at   = NULL,
+             decision      = NULL,
+             decided_by    = NULL,
+             decided_at    = NULL,
+             decision_note = NULL,
+             last_error    = NULL,
+             attempts      = 0,
+             started_at    = NULL,
+             last_heartbeat_at = NULL,
+             progress_pct  = NULL,
+             progress_message = NULL,
+             result_summary = ?
+       WHERE id = ?
+    `).run(new_summary, id);
+
+    return getTask(db, id);
+  })();
 }

@@ -165,6 +165,40 @@ node .../agent-task-cli.js mark-review <id> \
   --evidence=/path/to/evidence
 ```
 
+### Anti-pattern: don't promise future work
+
+When a criterion fails because you couldn't complete it in this attempt,
+**do not** write a note like "Started in background subagent" or "Scheduled for
+follow-up" or "Will continue after rebase". The worker cron will not pick up
+"promised future work" — your task is marked `review` (or `blocked`), and
+Byron approves or requeues based on the current state, not your intentions.
+
+If you genuinely have subagent work in flight, finish the parent task as
+`blocked` with the failing criteria marked `pass: false` and a `note` that
+explicitly names the subagent task IDs Byron should look for. Otherwise,
+"started in background subagent" is a euphemism for "this didn't work but I
+wanted to look productive" — it produces Byron-approves-a-broken-task
+incidents where he can't reopen or continue.
+
+### State machine reminders
+
+```
+                    ┌─────── done (terminal)
+                    │
+review ── approve ──┤
+                    │
+review ── reject ───┼─────── queued (worker picks up again)
+                    │
+review ── cancel ───┼─────── cancelled (terminal)
+                    │
+running ── mark-* ──┘
+```
+
+After `done` / `cancelled`, Byron can `POST /api/agent-tasks/:id/reopen` to
+reset the task to `queued` and try again. If you marked `done` prematurely,
+Byron will reopen — don't worry about it. But **don't mark `done` if you
+know it's wrong just to look productive**.
+
 ## Step 10 — Notify Byron (one ping per task)
 
 Send exactly one Telegram message to the home channel
