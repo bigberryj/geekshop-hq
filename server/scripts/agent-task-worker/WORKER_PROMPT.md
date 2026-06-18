@@ -84,6 +84,25 @@ stuck-detector doesn't requeue your work:
 node .../agent-task-cli.js heartbeat <id>
 ```
 
+**Report progress while you work.** The Mission Control UI shows a live
+progress bar per running task. Send progress updates as you go so Byron
+sees what's happening, not just that you're alive:
+
+```bash
+# Approximate percentage 0-100 — UI clamps and rounds it.
+node .../agent-task-cli.js heartbeat <id> --progress=25 --message='Reading project structure'
+node .../agent-task-cli.js heartbeat <id> --progress=60 --message='Building Brizy element tree'
+node .../agent-task-cli.js heartbeat <id> --progress=95 --message='Writing tests'
+```
+
+Rules of thumb:
+- Send a progress update at every ~25% increment for long tasks.
+- Use short, present-tense messages (≤500 chars). They appear in the UI.
+- A heartbeat without `--progress` is fine when nothing has changed
+  structurally — it just resets the stuck timer.
+- The `--message` field is optional; skip it if the previous message is
+  still accurate.
+
 ## Step 6 — Do the work
 
 Use your tools normally. The work is whatever the prompt says. Self-review

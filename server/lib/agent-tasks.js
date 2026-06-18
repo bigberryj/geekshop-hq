@@ -123,13 +123,23 @@ export function claimNextTask(db, { now = new Date().toISOString() } = {}) {
   })();
 }
 
-/** Worker heartbeat — called periodically while a task is in flight. */
-export function heartbeat(db, id, { now = new Date().toISOString() } = {}) {
-  db.prepare(`
-    UPDATE agent_tasks
-       SET last_heartbeat_at = ?
-     WHERE id = ? AND status = 'running'
-  `).run(now, id);
+/** Worker heartbeat — called periodically while a task is in flight.
+ * Optional progress reporting: progress_pct (0-100) and progress_message
+ * are written only if provided, so older workers keep working unchanged. */
+export function heartbeat(db, id, { now = new Date().toISOString(), progress_pct = undefined, progress_message = undefined } = {}) {
+  const sets = ['last_heartbeat_at = ?'];
+  const args = [now];
+  if (progress_pct !== undefined) {
+    const n = Math.max(0, Math.min(100, Math.round(Number(progress_pct) || 0)));
+    sets.push('progress_pct = ?');
+    args.push(n);
+  }
+  if (progress_message !== undefined) {
+    sets.push('progress_message = ?');
+    args.push(String(progress_message).slice(0, 500));
+  }
+  args.push(id);
+  db.prepare(`UPDATE agent_tasks SET ${sets.join(', ')} WHERE id = ? AND status = 'running'`).run(...args);
 }
 
 /**
@@ -307,7 +317,8 @@ export function listTasks(db, { status = 'all', limit = 100, offset = 0 } = {}) 
   const sql = `
     SELECT id, uid, title, source, source_ref, priority, status, attempts,
            max_attempts, created_at, started_at, finished_at,
-           last_heartbeat_at, result_summary, evidence_path, worker_run_id,
+           last_heartbeat_at, progress_pct, progress_message,
+           result_summary, evidence_path, worker_run_id,
            decision, decided_by, decided_at, decision_note
       FROM agent_tasks
       ${where ? `WHERE ${where}` : ''}

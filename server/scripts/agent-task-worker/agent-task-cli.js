@@ -18,6 +18,8 @@
  *     --run-id=<id>               worker_run_id
  *
  *   heartbeat <id>                Update last_heartbeat_at = now
+ *     --progress=<0-100>           Optional: report current progress percentage.
+ *     --message=<text>            Optional: short progress message (≤500 chars).
  *   stuck-requeue                 Bounce any running task whose heartbeat is
  *                                  older than the threshold back to queued.
  *
@@ -102,7 +104,11 @@ async function main() {
       case 'heartbeat': {
         const id = Number(rest[0]);
         if (!Number.isInteger(id) || id <= 0) fail('heartbeat: invalid id');
-        heartbeat(db, id);
+        const flags = parseFlags(rest.slice(1));
+        const hbOpts = {};
+        if (flags.progress !== undefined) hbOpts.progress_pct = Number(flags.progress);
+        if (flags.message !== undefined) hbOpts.progress_message = flags.message;
+        heartbeat(db, id, hbOpts);
         process.stdout.write('ok\n');
         return;
       }

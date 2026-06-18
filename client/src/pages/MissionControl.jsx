@@ -83,6 +83,30 @@ function toIsoDate(value) {
   return value.replace(' ', 'T') + 'Z';
 }
 
+/**
+ * ProgressBar for a running task.
+ *   pct is 0-100 or null/undefined → falls back to indeterminate (sliding stripe).
+ *   msg is the latest progress_message from the worker, shown under the bar when set.
+ */
+function ProgressBar({ pct, msg }) {
+  const known = Number.isFinite(pct) && pct >= 0 && pct <= 100;
+  const width = known ? `${Math.max(2, Math.round(pct))}%` : '35%';
+  return (
+    <div className="flex items-center gap-2 min-w-[140px]">
+      <div className="mc-progress-track flex-1" title={known ? `${pct}%` : 'progress unknown'}>
+        <div
+          className={`mc-progress-fill${known ? '' : ' indeterminate'}`}
+          style={{ width: known ? width : '35%' }}
+        />
+      </div>
+      <span className="text-xs font-mono text-slate-500 tabular-nums w-9 text-right">
+        {known ? `${Math.round(pct)}%` : '…'}
+      </span>
+      {msg && <span className="text-xs text-slate-600 truncate max-w-[260px]" title={msg}>{msg}</span>}
+    </div>
+  );
+}
+
 function ReviewChecklist({ items = [] }) {
   if (!items.length) return <p className="text-sm text-slate-500">No checklist items.</p>;
   return (
@@ -332,41 +356,75 @@ function TaskDrawer({ taskId, onClose, onChanged }) {
 
 export default function MissionControl() {
   const [status, setStatus] = useState('open');
-  const [list, setList] = useState({ items: [], total: 0 });
-  const [summary, setSummary] = useState(null);
-  const [openId, setOpenId] = useState(null);
-  const [showNew, setShowNew] = useState(false);
-  const [tick, setTick] = useState(0);
-  const [error, setError] = useState(null);
-  const [now, setNow] = useState(Date.now());
-  const intervalRef = useRef(null);
+    const [list, setList] = useState({ items: [], total: 0 });
+    const [summary, setSummary] = useState(null);
+    const [showNew, setShowNew] = useState(false);
+    const [openId, setOpenId] = useState(null);
+    const [error, setError] = useState(null);
+    const [now, setNow] = useState(Date.now());
+    const [tick, setTick] = useState(0);
+    // Row animation state:
+    //   seenIds: tasks we've seen on a previous poll (used to detect "new this tick" → slide in)
+    //   exitingIds: tasks that transitioned from non-terminal → terminal last tick (fade out)
+    const [seenIds, setSeenIds] = useState(() => new Set());
+    const [exitingIds, setExitingIds] = useState(() => new Set());
+    const intervalRef = useRef(null);
 
-  const reload = useCallback(async () => {
-    try {
-      const [a, b] = await Promise.all([
-        fetchJson(`/agent-tasks?status=${status}&limit=200`),
-        fetchJson('/agent-tasks/summary'),
-      ]);
-      setList(a); setSummary(b); setError(null);
-    } catch (e) {
-      setError(e.response?.data?.error || e.message);
-    }
-  }, [status]);
+    const reload = useCallback(async () => {
+      try {
+        const [a, b] = await Promise.all([
+          fetchJson(`/agent-tasks?status=${status}&limit=200`),
+          fetchJson('/agent-tasks/summary'),
+        ]);
+        // Compute exit transitions BEFORE we replace list. A task that
+        // was running/queued/review/blocked on the previous poll but is now
+        // done/failed/cancelled (or no longer in the filtered view) gets
+        // a one-tick fade-out before disappearing.
+        const prevIds = seenIds;
+        const newIds = new Set(a.items.map((t) => t.id));
+        const terminal = (s) => s === 'done' || s === 'failed' || s === 'cancelled';
+        const justExited = [];
+        for (const id of prevIds) {
+          const inCurrent = a.items.find((t) => t.id === id);
+          const wasOpen = prevIds.has(id); // any seen id counts
+          if (!inCurrent || terminal(inCurrent.status)) {
+            // Find the previous status (we don't have it here, so assume
+            // anything that newly shows terminal was non-terminal last poll)
+            justExited.push(id);
+          }
+        }
+        if (justExited.length) {
+          setExitingIds((cur) => new Set([...cur, ...justExited]));
+          // Clear exit flag after the fade animation completes.
+          setTimeout(() => {
+            setExitingIds((cur) => {
+              const next = new Set(cur);
+              justExited.forEach((id) => next.delete(id));
+              return next;
+            });
+          }, 650);
+        }
+        setList(a); setSummary(b); setError(null);
+        setSeenIds(newIds);
+      } catch (e) {
+        setError(e.response?.data?.error || e.message);
+      }
+    }, [status, seenIds]);
 
-  useEffect(() => { reload(); }, [reload]);
-  useEffect(() => { setTick((t) => t + 1); }, [reload]);
+    useEffect(() => { reload(); }, [reload]);
+    useEffect(() => { setTick((t) => t + 1); }, [reload]);
 
-  // Poll every 5s for the live view
-  useEffect(() => {
-    intervalRef.current = setInterval(() => { reload(); setNow(Date.now()); }, 5000);
-    return () => clearInterval(intervalRef.current);
-  }, [reload]);
+    // Poll every 5s for the live view
+    useEffect(() => {
+      intervalRef.current = setInterval(() => { reload(); setNow(Date.now()); }, 5000);
+      return () => clearInterval(intervalRef.current);
+    }, [reload]);
 
-  // Heartbeat for the duration column (every 1s)
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
+    // Heartbeat for the duration column (every 1s)
+    useEffect(() => {
+      const t = setInterval(() => setNow(Date.now()), 1000);
+      return () => clearInterval(t);
+    }, []);
 
   const onCreated = () => { setShowNew(false); reload(); };
   const onChanged = () => { reload(); };
@@ -424,15 +482,24 @@ export default function MissionControl() {
               <th className="py-2 pr-2">Priority</th>
               <th className="py-2 pr-2">Age</th>
               <th className="py-2 pr-2">Duration</th>
+              <th className="py-2 pr-2 min-w-[180px]">Progress</th>
               <th className="py-2 pr-2">Attempts</th>
             </tr>
           </thead>
           <tbody>
             {list.items.length === 0 && (
-              <tr><td colSpan={7} className="py-6 text-center text-slate-500">No tasks in this view.</td></tr>
+              <tr><td colSpan={8} className="py-6 text-center text-slate-500">No tasks in this view.</td></tr>
             )}
-            {list.items.map((t) => (
-              <tr key={t.id} className="border-t border-slate-100 hover:bg-slate-50 cursor-pointer"
+            {list.items.map((t) => {
+              const isNew = !seenIds.has(t.id) && seenIds.size > 0; // skip first poll (no "previous" baseline)
+              const isExiting = exitingIds.has(t.id);
+              const rowClass = [
+                'border-t border-slate-100 hover:bg-slate-50 cursor-pointer',
+                isNew ? 'mc-row-enter' : '',
+                isExiting ? 'mc-row-exit' : '',
+              ].filter(Boolean).join(' ');
+              return (
+              <tr key={t.id} className={rowClass}
                   onClick={() => setOpenId(t.id)}>
                 <td className="py-2 pr-2">
                   <div className="font-medium">{t.title}</div>
@@ -448,9 +515,15 @@ export default function MissionControl() {
                   {t.status === 'running' && <span className="text-yellow-700">{liveDuration(t.started_at, null, now)}</span>}
                   {t.status !== 'running' && liveDuration(t.started_at, t.finished_at)}
                 </td>
+                <td className="py-2 pr-2 text-xs">
+                  {t.status === 'running'
+                    ? <ProgressBar pct={t.progress_pct} msg={t.progress_message} />
+                    : <span className="text-slate-400">—</span>}
+                </td>
                 <td className="py-2 pr-2 text-xs">{t.attempts}/{t.max_attempts}</td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>

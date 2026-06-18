@@ -16,3 +16,46 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 .badge-yellow { @apply badge bg-yellow-100 text-yellow-800; }
 .badge-red { @apply badge bg-red-100 text-red-800; }
 .badge-slate { @apply badge bg-slate-100 text-slate-700; }
+
+/* Mission Control: live task row animations.
+ * `mc-row-enter` slides in a newly-seen row (queued task, fresh attempt).
+ * `mc-row-exit` fades out a row the moment it transitions to a terminal
+ * state (done/cancelled/failed), then it disappears from the next poll.
+ * Keep durations short — these happen every 5s and shouldn't feel laggy. */
+@keyframes mc-row-enter {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+@keyframes mc-row-exit {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+.mc-row-enter  { animation: mc-row-enter  220ms ease-out both; }
+.mc-row-exit   { animation: mc-row-exit   600ms ease-in  both; }
+
+/* Progress bar fill animates smoothly when the worker reports a new
+ * progress_pct. CSS transition on `width` keeps it fluid without any
+ * JS animation loop. */
+.mc-progress-track {
+  position: relative;
+  width: 100%;
+  height: 6px;
+  background: rgb(241 245 249);
+  border-radius: 9999px;
+  overflow: hidden;
+}
+.mc-progress-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, rgb(79 70 229), rgb(99 102 241));
+  border-radius: 9999px;
+  transition: width 480ms ease-out;
+}
+.mc-progress-fill.indeterminate {
+  width: 35% !important;
+  animation: mc-progress-indet 1.4s ease-in-out infinite;
+}
+@keyframes mc-progress-indet {
+  0%   { left: -35%; }
+  100% { left: 100%; }
+}
