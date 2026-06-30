@@ -75,6 +75,28 @@ The response also fires an SSE event (`kind: "agent_message_sent"`) so the Live 
 | `agent_message_sent` | you sent a message to an agent | `{ agent_id, message_id, text_preview }` |
 | `task_snapshot` | SSE initial connect — running/review/queued tasks | `{ task }` |
 
+## Inline approval buttons (Telegram)
+
+When a worker transitions a task to `review`, HQ sends a Telegram ping to the
+home channel **with three inline buttons**: ✅ Approve · 🔄 Requeue · ❌ Cancel.
+Tapping a button calls the existing `/api/agent-tasks/callback` endpoint with
+`action`, `id`, and `token` (the task's `uid`) — the same endpoint the gateway
+already supports as a `POST` so JSON bodies aren't required over a button tap.
+
+```
+action=approve&id=42&token=T-AB12CD
+```
+
+The callback path enforces the same state guards as the UI decision endpoint:
+the task has to be in `review` (or `blocked`), the token has to match the
+row's uid, the action has to be `approve|requeue|cancel`. Mismatches return
+`400` / `404` / `409`. Inline buttons are deliberately *sober* — they do not
+include payload content (no prompt snippets, no checklist text) to keep the
+Telegram message short and the callback URL under the 64-byte Telegram limit.
+
+Failed or skipped deliveries do not block the worker's task-finish path; the
+email notification already covers the case where Telegram is unavailable.
+
 ## Environment variables
 
 ```bash

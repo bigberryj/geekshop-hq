@@ -120,6 +120,40 @@ No cron prompts, scripts, or secrets are exposed.
   - Empty `name` is rejected.
   - Audit log records changed fields.
 
+### Customer 360 timeline (Phase 2 of accounting roadmap)
+
+- `GET /customers/:id/timeline`
+  - Returns a normalized, time-ordered feed of everything HQ knows about a customer, newest first. Powers the **Timeline** tab on `/customers/:id`.
+  - Eight event kinds, all sourced from existing tables (no new writes):
+    - `ticket_created` — a new ticket was opened
+    - `ticket_resolved` — ticket moved to resolved state
+    - `ticket_message` — inbound or outbound message on a ticket thread
+    - `appointment` — booking from the public `/book` page (matched by `customer_id` **or** case-folded email fallback for legacy `customer_id IS NULL` rows)
+    - `time_entry` — timer start/stop, with running entries surfacing as `running`
+    - `invoice` — every state transition on an invoice (created, sent, paid) emits its own event row so a paid invoice shows as 3 dots in chronological order
+    - `payment` — payment received against an invoice (Stripe + manual)
+    - `memory` — admin-curated or AI-extracted `customer_memory` entry
+  - Response shape:
+    ```
+    { customer: { id, name, email, status },
+      events: [ { id, kind, at, title, summary, href, meta } ],
+      counts: { ticket_created: N, ... },        // per-kind totals over the FULL eligible set, not the limited events[] list
+      generated_at: '2026-…Z' }
+    ```
+  - Filters (all optional, all defensive — invalid values produce no error):
+    - `?kinds=ticket,ticket_message` — comma-separated allow-list from the eight kinds above; unknown names are dropped
+    - `?from=ISO8601`, `?to=ISO8601` — inclusive / exclusive date bounds on the per-kind `at` column
+    - `?limit=N` — default 200, clamped to `[1, 1000]`
+  - Privacy guarantees — these are never projected into the response payload:
+    - `ticket_messages.body_html` (may contain PII / customer PII)
+    - `ticket_messages.gmail_message_id`, `ticket_messages.source_message_id` (Gmail audit headers)
+    - `payments.stripe_payment_intent_id`, `payments.stripe_charge_id` (Stripe audit keys)
+    - Bodies are truncated server-side at 240 chars before they leave the API; the client renders them plain-text only (`whitespace-pre-wrap`, no `dangerouslySetInnerHTML`).
+  - Status codes:
+    - `400 invalid customer id` — non-integer `:id`
+    - `404 customer not found` — valid id but no row
+    - `200` — happy path, including zero events (empty `events[]` + `counts: {}`)
+
 ## Invoices
 
 - `GET /invoices`
@@ -199,6 +233,7 @@ A durable queue of tasks Byron asks J5 to do. Surfaces in the HQ UI at
   - Lightweight shape designed for Telegram inline-button callbacks (and any other push-style client where JSON bodies are awkward).
   - Query params: `action`, `id`, `token` (the task's `uid` for sanity). Body fields are accepted as a fallback for clients that prefer JSON.
   - Returns the updated task on success, 409 on transition conflict, 400 on bad token / unknown action, 404 on missing task.
+  - Wired by `notifyTaskForApproval()` to the Approve/Requeue/Cancel inline buttons on review-triggered Telegram pings. See `docs/mission-control-agents.md#inline-approval-buttons-telegram`.
 
 ### Worker contract
 
@@ -251,3 +286,141 @@ on the checklist in the Mission Control drawer are the final word.
 - MiniMax M3 is the primary configured provider for current local development.
 - The API key is read from `MINIMAX_API_KEY` and is never committed.
 - OpenAI is optional and only used if `OPENAI_API_KEY` is present.
+## Accounting module (MVP, /api/accounting/*)
+Solo-owner accounting scaffold on top of the existing customers + invoices.
+All routes require an authenticated admin session (same `requireAdmin`
+pattern as the rest of HQ).
+
+### Status
+- `GET /api/accounting/status` — Returns which features are wired up vs deferred.
+
+### Tax rates
+- `GET /api/accounting/tax-rates` — list
+- `POST /api/accounting/tax-rates` — create `{ name, rate_bps, jurisdiction?, is_compound?, active? }`. `rate_bps` is basis points (5% = 500). Stored as integer.
+- `PUT /api/accounting/tax-rates/:id` — update
+
+### Products (catalog)
+- `GET /api/accounting/products?active=1&q=foo` — list / search
+- `POST /api/accounting/products` — create. Returns 409 on duplicate SKU.
+- `PUT /api/accounting/products/:id` — update
+
+### Expense categories
+- `GET /api/accounting/expense-categories` — list (joined with tax rate)
+- `POST /api/accounting/expense-categories` — create `{ name, tax_rate_id? }`
+
+### Expenses
+- `GET /api/accounting/expenses?from=YYYY-MM-DD&to=YYYY-MM-DD&category_id=&vendor=` — list with filters
+- `POST /api/accounting/expenses` — create
+- `PUT /api/accounting/expenses/:id` — update
+- `DELETE /api/accounting/expenses/:id` — delete an expense and its receipt attachment
+- `POST /api/accounting/expenses/:id/receipt` — upload receipt attachment (multipart/form-data)
+- `GET /api/accounting/expenses/:id/receipt` — download receipt attachment
+- `DELETE /api/accounting/expenses/:id/receipt` — delete receipt attachment
+
+### Payments
+- `GET /api/accounting/payments?invoice_id=&method=&status=` — list
+- `POST /api/accounting/payments` — create. `method` is `stripe|cash|cheque|e_transfer|other`. Stripe `payment_intent.id` stored + appended to `payment_events` (unique-key idempotency). After every successful insert, `reconcileInvoiceStatus()` is run; the invoice's `status` is auto-promoted to `partial` (some money covered) or `paid` (covered in full) accordingly. `paid_at` is stamped on first-time promotion to `paid` and preserved thereafter.
+- `PUT /api/accounting/payments/:id` — adjust `notes`, `received_at`, or `status` (`pending|succeeded|failed|refunded`). `amount_cents` and `invoice_id` are intentionally immutable — corrections use a fresh row or a refund. Status edits re-run the reconciler because a refund flips the invoice back to `partial`.
+- `GET /api/accounting/payments/summary?invoice_id=&customer_id=&status=&since=&until=` — invoice rollup with payment totals. Returns one row per invoice including:
+  - `total_cents`, `paid_cents`, `pending_cents`, `refunded_cents`, `balance_cents = max(0, total - paid)` — all integer cents, ref never raises balance.
+  - `computed_status` — live status from the ledger (`sent|viewed|overdue|partial|paid`).
+  - `status_in_sync` — `true` when the persisted `invoices.status` matches the computed one. `false` rows need a reconciler pass.
+  - `last_payment_at`, `payment_count` — operator-facing freshness markers.
+  Ordered by overdue-first, partial-second, then `created_at DESC`. Limit 500.
+- `POST /api/accounting/payments/reconcile` — sweeps every invoice whose status is NOT (`cancelled`, `paid`, `draft`) and reapplies `reconcileInvoiceStatus()`. Idempotent. Returns `{ count, updated: [{id, from, to}] }`. Use after bulk edits or whenever `status_in_sync = false` shows up widely.
+
+### Invoice state machine (Phase 3)
+
+See `docs/schema.md` for the full transition diagram. The route layer enforces these rules:
+
+- Manual `POST /api/invoices/:id/status` accepts `{draft | sent | viewed | overdue | paid | cancelled}`. `partial` is intentionally NOT in the allowlist — it is derived only from the ledger.
+- `paid_at` is set the first time the invoice's succeeded payments reach `total_cents` and is preserved across refunds/demotions. The audit log entry (`invoice.status_auto`) records every auto flip.
+- A past-due `partial` does NOT auto-promote to `overdue`; the partial is the steady state while money continues to arrive.
+
+### Reports
+- `GET /api/accounting/reports/pnl?from=&to=` — income, expense, net
+- `GET /api/accounting/reports/sales-by-customer?from=&to=`
+- `GET /api/accounting/reports/expenses-by-category?from=&to=`
+- `GET /api/accounting/reports/tax-collected?from=&to=`
+- `GET /api/accounting/reports/outstanding` — sent/overdue invoices
+- `GET /api/accounting/tax/summary?from=&to=&format=` — tax collected on invoices/payments, tax paid on expenses, net remittance summary. Format can be 'csv' for CSV export.
+- `GET /api/accounting/tax/pdf-ready?from=&to=` — PDF-ready payload for tax remittance summary.
+
+### Dashboard rollup
+- `GET /api/accounting/dashboard` — unpaid/overdue counts, MTD income/expense, net, recent payments/expenses.
+
+### Revenue leakage (Phase 1 of billing/accounting roadmap)
+- `GET /api/accounting/leakage?stale_draft_days=14&stale_invoice_days=30` — single-call rollup of the five leakage buckets. `stale_draft_days` and `stale_invoice_days` are clamped to `[1, 365]` and default to 14 and 30 respectively. Labour rate is read from the `labour_rate_cents_per_hour` setting (falls back to $100/h).
+  - `uninvoiced_time.entries[]` — each row has `id`, `ticket_id`, `ticket_uid`, `duration_seconds`, `running`, `value_cents`, timestamps. `by_ticket[]` groups by ticket and sums value.
+  - `resolved_tickets_with_uninvoiced_time.groups[]` — subset of `by_ticket` where the parent ticket's status is `resolved`. Highest-signal bucket (work is done and won't reopen).
+  - `stale_draft_invoices.invoices[]` — draft invoices older than `stale_draft_days`.
+  - `overdue_sent_invoices.invoices[]` — sent/overdue invoices with `due_at < now`; each row has `days_overdue`.
+  - `dormant_customers.customers[]` — active customers with open tickets or uninvoiced time whose most recent invoice is missing OR older than `stale_invoice_days`. Each row exposes `open_tickets`, `uninvoiced_entries`, `uninvoiced_seconds`, `last_invoice_at`, `last_paid_or_sent_at`.
+  - All amounts use integer cents. Running timers report `value_cents: 0` (elapsed is unknown) rather than guessing.
+  - Renders as the `LeakagePanel` on `/accounting` (Dashboard tab). Same endpoint is reusable from Money/Inbox later without server changes.
+
+### Deferred (explicitly out of scope for the MVP)
+- PDF invoice generation (existing text+HTML renderer exists; needs PDF backend)
+- Stripe Checkout / Payment Links (gated on STRIPE_SECRET_KEY)
+- Stripe webhook receiver (gated on STRIPE_WEBHOOK_SECRET; payment_events schema is ready)
+- QuickBooks Online import (needs QBO OAuth + mapping UI; CSV import is the v0.2 step)
+
+## Contract Clients — admin (`/api/contract-clients/*`)
+
+Multi-location corporate clients with monthly support contracts. Replaces
+the Google Sheets "Contract Clients" workbook. All routes require admin
+auth (`hq_sid` cookie in production; open in development). Returns JSON.
+
+- `GET    /api/contract-clients?status=&search=` — list clients (default `status=active`)
+- `POST   /api/contract-clients` — create (`name` required)
+- `GET    /api/contract-clients/:id` — client detail (locations, contact summary, counts, recent 25 requests)
+- `PATCH  /api/contract-clients/:id` — update any of the editable fields
+- `POST   /api/contract-clients/:id/archive` — soft-archive
+- `GET    /api/contract-clients/:id/locations` — list locations with counts
+- `POST   /api/contract-clients/:id/locations` — add location (`label` required)
+- `PATCH  /api/contract-clients/:id/locations/:lid` — update location
+- `GET    /api/contract-clients/:id/locations/:lid/contacts` — list contacts
+- `POST   /api/contract-clients/:id/locations/:lid/contacts` — add contact
+- `PATCH  /api/contract-clients/contacts/:ctid` — edit a contact (name, email, phone, role, is_office_manager, notify_on_request, status, location_id). Cross-client moves rejected with 400; moving to a location outside the contact's current client also rejected with 400. Audit-logged as `client_contact.update`.
+- `DELETE /api/contract-clients/contacts/:ctid` — remove a contact. Returns 409 `contact_in_use` if the contact submitted any `contract_requests` (history integrity — submitting_contact_id FK is `ON DELETE RESTRICT`); portal credentials and invites referencing the contact cascade to `NULL` (those FKs are `ON DELETE SET NULL`). Audit-logged as `client_contact.delete`.
+- `GET    /api/contract-clients/:id/requests?status=&location_id=` — list requests; `location_id` (optional) restricts to one location of this client — the server verifies the location belongs to the client before applying the filter, and an empty/blank value is treated as no filter. Priority values are `low | normal | high | urgent`.
+- `GET    /api/contract-clients/requests/:rid` — request detail with events
+- `POST   /api/contract-clients/:id/requests` — admin-raised request (auto-creates a request_uid like `CR-000123`)
+- `PATCH  /api/contract-clients/:id/requests/:rid` — admin edits (status, assigned_to, priority, category)
+- `POST   /api/contract-clients/requests/:rid/cancel` — admin cancel (uses same `canCancel()` rule as portal)
+- `GET    /api/contract-clients/:id/assets?location_id=` — list assets
+- `POST   /api/contract-clients/:id/assets` — add asset (`location_id`, `type` required)
+- `PATCH  /api/contract-clients/assets/:aid` — update asset
+- `GET    /api/contract-clients/:id/portal-users` — list portal credentials
+- `POST   /api/contract-clients/:id/invites` — create magic-link invite token (returns `{ token, expires_at, ... }`)
+
+## Client Portal (`/api/portal/*`)
+
+The public-facing surface for office managers. Uses the `hq_csid` cookie
+(set by `/api/portal/login`); never share the admin `hq_sid`. Every
+read/write is scoped server-side via `locationScopeFragment()` so a
+location_manager can never see data outside their scope.
+
+- `POST /api/portal/login` — `{ email, password }` → sets `hq_csid` cookie
+- `POST /api/portal/logout` — clears the cookie
+- `GET  /api/portal/me` — current session summary: client name, scope, visible locations
+- `GET  /api/portal/assets?location_id=` — devices at locations you can see
+- `GET  /api/portal/contacts` — contacts in your scope (for picking the request submitter)
+- `GET  /api/portal/requests` — visible requests; uses `location_id` scoped to the credential
+- `GET  /api/portal/requests/:rid` — detail with events (admin-only fields hidden)
+- `POST /api/portal/requests` — submit a new request. Validates that the chosen `location_id`, `contact_id`, and optional `asset_id` are all in the session's scope. Auto-mints a `CR-NNNNNN` uid.
+- `POST /api/portal/requests/:rid/cancel` — cancel-eligible check via `canCancel()`. Returns `409 { reason }` when not eligible (terminal, already-assigned to staff, cross-client, etc).
+- `GET  /api/portal/redeem/:token` — peek invite (returns `client`, `email`, `scope_type`)
+- `POST /api/portal/redeem/:token` — `{ password }` → consumes the invite, creates the credential, logs the user in (cookie set)
+
+### Cancel rules (admin + portal)
+
+`canCancel(credential, requestRow)` in `lib/contract-clients.js`:
+
+- Admin (no credential): any non-terminal request.
+- Submitting contact in scope: cancellable when status ∈ {open, in_progress} AND `assigned_to IS NULL`.
+- Submitting contact once assigned: cancelled only by admin.
+- Non-submitter office manager at the same client: cancellable until staff assigns (`assigned_to IS NULL`).
+- Terminal (`resolved`, `cancelled`): never cancellable.
+- Cross-client: never.
+- Disabled credential (`disabled_at`): never.
