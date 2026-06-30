@@ -55,12 +55,94 @@ export function getTaxModel(key) {
 }
 
 /**
+ * Normalize a single invoice line item into a canonical shape that
+ * downstream code (computeInvoiceTotals, renderers, PDF, reports) can
+ * rely on. The codebase grew two overlapping schemas:
+ *
+ *   Legacy (Money / draft-from-time):
+ *     { description, qty, unit_price, total_cents?, type?, source_time_entry_id? }
+ *
+ *   Modern (Accounting invoice editor):
+ *     { description, quantity, unit_price_cents, taxable?, tax_rate_id? }
+ *
+ * Both are accepted as input and normalised to BOTH key sets so the
+ * persisted JSON reads correctly in renderers (which still use the legacy
+ * keys) AND in the SQL reports (which already coalesce both).
+ *
+ * Inputs that are not numbers (e.g. NaN, null, undefined) become 0.
+ * Other pass-through keys (type, source_time_entry_id, product_id, etc.)
+ * are preserved verbatim so legacy flows keep their metadata.
+ */
+export function normalizeLineItem(li) {
+  if (!li || typeof li !== 'object') {
+    return { description: '', quantity: 0, qty: 0, unit_price_cents: 0, unit_price: 0, total_cents: 0, taxable: true, tax_rate_id: null };
+  }
+  const quantity = Number.isFinite(Number(li.quantity)) ? Number(li.quantity)
+                  : Number.isFinite(Number(li.qty))      ? Number(li.qty)
+                  : 1;
+  const unit_price_cents = Number.isFinite(Number(li.unit_price_cents)) ? Number(li.unit_price_cents)
+                          : Number.isFinite(Number(li.unit_price))      ? Number(li.unit_price)
+                          : 0;
+  let total_cents;
+  if (Number.isFinite(Number(li.total_cents))) {
+    total_cents = Math.round(Number(li.total_cents));
+  } else {
+    total_cents = Math.round(quantity * unit_price_cents);
+  }
+  const description = String(li.description ?? '');
+  // taxable defaults to true when omitted (matches "all lines are taxable unless you uncheck the box").
+  // A non-numeric / missing value also means "taxable" — the only falsy inputs are explicit `false` / `0`.
+  let taxable = true;
+  if (li.taxable === false || li.taxable === 0 || li.taxable === '0' || li.taxable === 'false') taxable = false;
+  const tax_rate_id = li.tax_rate_id == null || li.tax_rate_id === '' ? null : Number(li.tax_rate_id);
+
+  // Build a fresh object that:
+  //  1) starts with the original keys preserved (so type, source_time_entry_id,
+  //     product_id, currency, etc. all survive), and
+  //  2) overwrites the canonicalised numeric / tax fields with the
+  //     computed values.
+  // Doing the spread first lets the explicit assignments win when both
+  // names are present (e.g. description, qty, unit_price).
+  const out = { ...li };
+  out.description = description;
+  out.quantity = quantity;
+  out.qty = quantity;
+  out.unit_price_cents = unit_price_cents;
+  out.unit_price = unit_price_cents;
+  out.total_cents = total_cents;
+  out.taxable = taxable;
+  out.tax_rate_id = tax_rate_id;
+  return out;
+}
+
+/**
+ * Normalize an array of line items. Always returns a fresh array of fresh
+ * objects — never mutates the input.
+ */
+export function normalizeLineItems(lineItems) {
+  if (!Array.isArray(lineItems)) return [];
+  return lineItems.map(normalizeLineItem);
+}
+
+/**
  * Compute subtotal, per-line tax, total tax, and grand total for an invoice.
  *
  * Inputs:
- *   model:           one of TAX_MODELS keys (e.g. 'gst_pst_bc')
- *   lineItems:       [{ qty, unit_price, description? }] (unit_price in cents)
- *   tax_cents_override: number | undefined — bypass the model
+ *   model:           one of TAX_MODELS keys (e.g. 'gst_pst_bc') — used when
+ *                    no line item specifies its own tax_rate_id
+ *   lineItems:       [{ qty | quantity, unit_price | unit_price_cents, ... }]
+ *                    (prices in cents). Mixed shapes are accepted.
+ *   tax_cents_override: number | undefined — bypass the model entirely
+ *   taxRates:        optional Map<id, {name, rate_bps}> or array of the
+ *                    same shape. When provided, line items with a
+ *                    `tax_rate_id` use that rate (basis points) per-line
+ *                    instead of the global model. Lines without a
+ *                    `tax_rate_id` still fall back to the global model.
+ *
+ * Per-line tax is OFF by default — the existing behaviour is preserved when
+ * the caller doesn't supply taxRates. The Accounting invoice editor
+ * supplies them, so the line-by-line tax-rates model is authoritative
+ * there.
  *
  * Returns:
  *   {
@@ -69,15 +151,25 @@ export function getTaxModel(key) {
  *     tax_model_key, tax_model_label,
  *   }
  */
-export function computeInvoiceTotals({ model = DEFAULT_TAX_MODEL, lineItems = [], tax_cents_override } = {}) {
-  const subtotal = lineItems.reduce((s, li) => {
-    // Prefer pre-computed integer totals when present. Labour lines can use
-    // fractional hours, and after the private minimum-charge floor is applied
-    // the rounded display rate may not multiply back to the exact cents. The
-    // stored `total_cents` is the source of truth for invoice math.
-    if (Number.isFinite(Number(li.total_cents))) return s + Math.round(Number(li.total_cents));
-    return s + Math.round((Number(li.qty) || 1) * (Number(li.unit_price) || 0));
-  }, 0);
+export function computeInvoiceTotals({
+  model = DEFAULT_TAX_MODEL,
+  lineItems = [],
+  tax_cents_override,
+  taxRates,
+} = {}) {
+  // Normalize first so all downstream math sees a consistent shape.
+  const normalized = normalizeLineItems(lineItems);
+  // Subtotal is the sum of ALL line `total_cents` — it's the invoice grand
+  // subtotal the customer sees (e.g. "$130 of services + parts"). Only
+  // *taxable* lines contribute to the tax base, so tax is computed on the
+  // sum of taxable line totals, not on the full subtotal. (Regression
+  // pinned by T-79EB14 invoice-preview-total.test.js — a non-taxable
+  // "warranty hour" line should NOT pull tax into the total.)
+  const subtotal = normalized.reduce((s, li) => s + li.total_cents, 0);
+  const taxableBase = normalized
+    .filter((li) => li.taxable)
+    .reduce((s, li) => s + li.total_cents, 0);
+
   const def = getTaxModel(model);
 
   let tax_lines;
@@ -86,11 +178,19 @@ export function computeInvoiceTotals({ model = DEFAULT_TAX_MODEL, lineItems = []
     tax_lines = tax_cents_override > 0
       ? [{ label: 'Tax (manual)', rate: null, amount_cents: tax_cents_override }]
       : [];
+  } else if (hasPerLineRates(normalized) && taxRates) {
+    // Per-line tax: each taxable line contributes its tax_rate's amount.
+    // Aggregate by rate label so a 5%-GST line + 5%-GST line shows as one
+    // entry in tax_lines (clean invoice printout).
+    tax_lines = computePerLineTax(normalized, taxRates, def);
   } else {
+    // Use the taxable base for the global model too — non-taxable lines
+    // (taxable === false) must NOT contribute to the tax calculation even
+    // when no per-line rate is supplied.
     tax_lines = def.lines.map((ln) => ({
       label: ln.label,
       rate: ln.rate,
-      amount_cents: roundHalfUpToCent(subtotal * ln.rate),
+      amount_cents: roundHalfUpToCent(taxableBase * ln.rate),
     }));
   }
 
@@ -106,10 +206,183 @@ export function computeInvoiceTotals({ model = DEFAULT_TAX_MODEL, lineItems = []
 }
 
 /**
+ * Return true iff any line has a tax_rate_id (and is taxable). Used to
+ * decide whether to switch to per-line tax math.
+ */
+function hasPerLineRates(normalized) {
+  return normalized.some((li) => li.taxable && li.tax_rate_id != null);
+}
+
+/**
+ * Index a taxRates collection (array or Map) by id. Returns a Map.
+ */
+function indexTaxRates(taxRates) {
+  if (!taxRates) return new Map();
+  if (taxRates instanceof Map) return taxRates;
+  if (Array.isArray(taxRates)) {
+    const m = new Map();
+    for (const r of taxRates) {
+      if (r && r.id != null) m.set(Number(r.id), r);
+    }
+    return m;
+  }
+  return new Map();
+}
+
+/**
+ * Compute per-line tax and aggregate by rate label. Lines with no
+ * tax_rate_id fall back to the first line of the global model. Non-taxable
+ * lines (taxable === false) contribute nothing.
+ *
+ * Aggregation: amounts in the same `name` bucket are summed; the rate
+ * echoed is the rate_bps/10000 of the rate that contributed (assumed
+ * uniform — the operator edits rates as integer bps so this can't drift
+ * within a single invoice).
+ */
+function computePerLineTax(normalized, taxRates, model) {
+  const idx = indexTaxRates(taxRates);
+  const fallback = model.lines[0]; // first line of the configured model
+  // Map<label, {label, rate, amount_cents}>
+  const buckets = new Map();
+
+  for (const li of normalized) {
+    if (!li.taxable) continue;
+    const lineTotal = li.total_cents;
+    if (lineTotal === 0) continue;
+
+    let rate;
+    let label;
+    if (li.tax_rate_id != null && idx.has(li.tax_rate_id)) {
+      const def = idx.get(li.tax_rate_id);
+      rate = Number(def.rate_bps) / 10000;
+      label = String(def.name || 'Tax');
+    } else if (fallback) {
+      rate = fallback.rate;
+      label = fallback.label;
+    } else {
+      continue;
+    }
+    if (!Number.isFinite(rate) || rate === 0) continue;
+    const amount = roundHalfUpToCent(lineTotal * rate);
+    if (amount === 0) continue;
+    const key = label.toLowerCase();
+    const prev = buckets.get(key) || { label, rate, amount_cents: 0 };
+    prev.amount_cents += amount;
+    buckets.set(key, prev);
+  }
+
+  return [...buckets.values()];
+}
+
+/**
  * Convert seconds to a 4-decimal-hour value (used for qty in invoice lines).
  */
 export function durationToHours(seconds) {
   return Math.round((seconds / 3600) * 10000) / 10000;
+}
+
+/**
+ * Phase 5 — Tax summary helpers (pure functions, no DB).
+ *
+ * `aggregateTaxLines(lines)` accepts the heterogeneous `tax_lines`
+ * arrays stored on `invoices.tax_lines` (JSON) and returns a stable
+ * breakdown by `label`. Some invoices have a tax_cents_override (single
+ * synthetic "Tax (manual)" line), others have model-generated multi-line
+ * arrays, and legacy rows may be missing the field entirely — all should
+ * roll up cleanly.
+ *
+ * `rollupTaxBreakdown(breakdowns)` merges N breakdowns (e.g. many
+ * invoices worth of tax_lines) into a single sorted-by-amount-desc
+ * `[{label, amount_cents, rate?}]` array. Used by the Phase 5 endpoint
+ * to present "GST collected", "PST collected", etc., with optional
+ * `rate` echoed when every contributing line agreed on the rate.
+ *
+ * Both helpers operate on integer cents and never touch floats — so
+ * the API response, CSV export, and UI totals are guaranteed to match
+ * to the cent.
+ */
+
+/**
+ * @param {Array<{label: string, rate?: number|null, amount_cents: number}>|null|undefined} lines
+ * @returns {Array<{label: string, amount_cents: number, rate?: number|null}>}
+ */
+export function aggregateTaxLines(lines) {
+  if (!Array.isArray(lines)) return [];
+  const out = new Map();
+  for (const ln of lines) {
+    if (!ln) continue;
+    const label = String(ln.label || '').trim();
+    const amount = Math.round(Number(ln.amount_cents) || 0);
+    if (!label || amount === 0) continue;
+    const key = label.toLowerCase();
+    const prev = out.get(key) || { label, amount_cents: 0, rate: ln.rate ?? null };
+    prev.amount_cents += amount;
+    out.set(key, prev);
+  }
+  return [...out.values()];
+}
+
+/**
+ * @param {Array<Array<{label: string, amount_cents: number, rate?: number|null}>>} breakdowns
+ * @returns {Array<{label: string, amount_cents: number, rate?: number|null}>}
+ */
+export function rollupTaxBreakdown(breakdowns) {
+  const out = new Map();
+  for (const breakdown of breakdowns) {
+    if (!Array.isArray(breakdown)) continue;
+    for (const ln of breakdown) {
+      if (!ln) continue;
+      const label = String(ln.label || '').trim();
+      const amount = Math.round(Number(ln.amount_cents) || 0);
+      if (!label || amount === 0) continue;
+      const key = label.toLowerCase();
+      const prev = out.get(key) || { label, amount_cents: 0, rate: ln.rate ?? null };
+      prev.amount_cents += amount;
+      // If multiple sources contribute different rates (unlikely but
+      // possible during a model change), prefer the most-recent
+      // non-null rate. The label is the canonical visual key.
+      if (ln.rate != null) prev.rate = ln.rate;
+      out.set(key, prev);
+    }
+  }
+  // Sort by amount descending — operator cares about the big bar first.
+  return [...out.values()].sort((a, b) => b.amount_cents - a.amount_cents);
+}
+
+/**
+ * CSV-safe value coercion. Wraps anything containing comma / quote /
+ * newline in double quotes and escapes internal quotes by doubling
+ * them. Mirrors RFC 4180 quoting so Excel / LibreOffice / `csv.reader`
+ * consume it without surprises.
+ *
+ * @param {unknown} v
+ * @returns {string}
+ */
+export function csvCell(v) {
+  if (v == null) return '';
+  const s = String(v);
+  if (/[",\n\r]/.test(s)) {
+    return `"${s.replace(/"/g, '""')}"`;
+  }
+  return s;
+}
+
+/**
+ * Build a CSV string from a header row + data rows. Header names are
+ * quoted via the same rules as data so an operator can dump this file
+ * straight into QuickBooks / CRA / an accountant's spreadsheet.
+ *
+ * @param {string[]} headers
+ * @param {Array<Array<unknown>>} rows
+ * @returns {string}
+ */
+export function toCsv(headers, rows) {
+  const lines = [];
+  lines.push(headers.map(csvCell).join(','));
+  for (const r of rows) lines.push(r.map(csvCell).join(','));
+  // RFC 4180 uses CRLF; Excel accepts it; git diffs look slightly
+  // noisier but the canonical reference is CRLF, so use it.
+  return lines.join('\r\n') + '\r\n';
 }
 
 /**
