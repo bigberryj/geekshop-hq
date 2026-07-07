@@ -33,6 +33,19 @@ The chat panel first checks HQ env vars, then reuses the existing Hermes gateway
 
 So if Byron already configured `TELEGRAM_BOT_TOKEN` + `TELEGRAM_HOME_CHANNEL` for the gateways, Mission Control can send without duplicating secrets into `server/.env`. Explicit HQ vars (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, or per-profile overrides) still win if set. The default handles are hardcoded for `default` (`@john5wizbot`) and `minimax` (`@john5minimaxbot`); override via `TELEGRAM_BOT_HANDLE_DEFAULT` / `TELEGRAM_BOT_HANDLE_MINIMAX` if needed.
 
+
+## Tasks page — July 2026 evidence-first controls
+
+The Tasks tab now borrows the best ideas from the latest Hermes Agent releases:
+
+- **Done contracts in the New Task form.** The form has an explicit acceptance-criteria textarea. Each non-empty line is sent as `acceptance_criteria[]`, so the worker has concrete evidence checks before it can ask Byron for approval.
+- **Starter templates.** Verification contract, parallel research/audit, and reusable-learning templates prefill a self-contained prompt plus done criteria. They are deliberately editable; they are launch pads, not magic spells.
+- **Operator-focus panel.** The top-right card counts filtered tasks that need a decision, tasks currently in flight, and review/blocked tasks missing an `evidence_path`. The goal is to make the next action obvious instead of making Byron read every row like a log archaeologist.
+- **Search and source filters.** Client-side filtering over the currently loaded task list covers title, uid, source, result summary, and evidence path; the source dropdown is built from the loaded rows.
+- **Quick approve.** A `review` row can be approved directly from the table when the checklist/evidence is already obvious. `blocked` still points Byron into the drawer, because a requeue/cancel note matters there.
+
+These are UI-only improvements; no schema migration was required.
+
 ## API surface
 
 ```

@@ -205,8 +205,11 @@ No cron prompts, scripts, or secrets are exposed.
 ## Mission Control (agent task queue)
 
 A durable queue of tasks Byron asks J5 to do. Surfaces in the HQ UI at
-`/mission-control` with live polling, a drawer showing the original ask
-+ worker's self-review, and Approve / Send-back / Cancel buttons.
+`/mission-control` with live polling, search/source filters, an evidence-first
+operator-focus panel, task templates, explicit done-contract criteria, a drawer
+showing the original ask + worker self-review, and Approve / Send-back /
+Cancel buttons. Review rows can also be approved from the table's quick-action
+column when no extra note is needed.
 
 ### Endpoints
 
@@ -219,7 +222,7 @@ A durable queue of tasks Byron asks J5 to do. Surfaces in the HQ UI at
   - Body: `{ title, prompt, source?, source_ref?, priority?, max_attempts?, acceptance_criteria? }`
   - `source` ∈ `hq_ui` (default) | `telegram` | `email` | `voice` | `seed`.
   - `prompt` capped at 32 KiB; `title` at 240 chars. Exceeding returns 400.
-  - `acceptance_criteria`: array of `{ req, kind? }`. Empty / missing → worker infers 2–5 criteria.
+  - `acceptance_criteria`: array of `{ req, kind? }`. Empty / missing → worker infers 2–5 criteria. The HQ New Task form now treats this as a done contract and offers starter templates for verification, parallel research/audit, and reusable-learning capture.
   - Returns 201 with the new task (full detail including `prompt`).
 - `GET    /api/agent-tasks/:id`
   - Full task including `prompt`, `acceptance_criteria`, `review_checklist`. 404 if missing.

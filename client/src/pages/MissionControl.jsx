@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef } from 'react';
+import { useEffect, useState, useCallback, useRef, useMemo } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchJson, postJson } from '../lib/api.js';
 import {
@@ -133,9 +133,59 @@ function ReviewChecklist({ items = [] }) {
   );
 }
 
+const TASK_TEMPLATES = [
+  {
+    key: 'verification',
+    label: 'Verification contract',
+    title: 'Verify and harden ',
+    prompt: 'Goal:\n\nContext / paths:\n\nConstraints:\n- Do not deploy or push unless explicitly approved.\n- Preserve existing data and document any schema changes.\n\nRequired evidence:\n- Run the relevant tests and paste the exact output.\n- Browser-test the affected user-facing flow.\n- Update docs/changelog.md and any touched API/schema docs.\n\nReport back with what changed, what passed, and what is still open.',
+    criteria: [
+      'Relevant automated tests pass with captured output',
+      'Affected browser flow is manually verified',
+      'Docs/changelog entry is updated',
+      'Security checklist reviewed for touched surface',
+    ],
+  },
+  {
+    key: 'fanout',
+    label: 'Parallel research / audit',
+    title: 'Research options for ',
+    prompt: 'Goal:\n\nUse parallel/background subagents where useful, then consolidate the findings into one recommendation.\n\nCompare:\n- Current behavior\n- Candidate improvement A\n- Candidate improvement B\n\nReturn a ranked recommendation with tradeoffs, implementation risk, and exact next steps.',
+    criteria: [
+      'At least two independent options are compared',
+      'Recommendation includes risks and effort estimate',
+      'Next implementation steps are specific enough to queue',
+    ],
+  },
+  {
+    key: 'learning',
+    label: 'Capture reusable learning',
+    title: 'Document reusable workflow for ',
+    prompt: 'Goal:\n\nTurn this into a reusable workflow if the task uncovers a repeatable procedure. Do not save temporary task progress as memory. Prefer a skill for procedures and a concise doc note for project-specific decisions.\n\nInclude where the reusable knowledge should live and how to verify it next time.',
+    criteria: [
+      'Reusable procedure is identified or explicitly ruled out',
+      'Skill/doc/memory destination is justified',
+      'Verification steps for future reuse are documented',
+    ],
+  },
+];
+
+function criteriaFromText(text) {
+  return text
+    .split('\n')
+    .map((line) => line.replace(/^[-*\d.)\s]+/, '').trim())
+    .filter(Boolean)
+    .map((req) => ({ req, kind: 'verification' }));
+}
+
+function criteriaToText(items) {
+  return items.map((req) => `- ${req}`).join('\n');
+}
+
 function NewTaskForm({ onCreated, onCancel }) {
   const [title, setTitle] = useState('');
   const [prompt, setPrompt] = useState('');
+  const [criteriaText, setCriteriaText] = useState(criteriaToText(TASK_TEMPLATES[0].criteria));
   const [priority, setPriority] = useState(0);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState(null);
@@ -154,9 +204,10 @@ function NewTaskForm({ onCreated, onCancel }) {
         prompt: prompt.trim(),
         source: 'hq_ui',
         priority,
+        acceptance_criteria: criteriaFromText(criteriaText),
       });
       onCreated(created);
-      setTitle(''); setPrompt(''); setPriority(0);
+      setTitle(''); setPrompt(''); setCriteriaText(criteriaToText(TASK_TEMPLATES[0].criteria)); setPriority(0);
     } catch (e2) {
       setError(e2.response?.data?.error || e2.message || 'Failed to create task');
     } finally {
@@ -166,7 +217,25 @@ function NewTaskForm({ onCreated, onCancel }) {
 
   return (
     <form onSubmit={submit} className="card space-y-3">
-      <h3 className="font-semibold flex items-center gap-2"><Plus size={16} /> New task</h3>
+      <div className="flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+        <h3 className="font-semibold flex items-center gap-2"><Plus size={16} /> New task</h3>
+        <div className="flex flex-wrap gap-2" aria-label="Task templates">
+          {TASK_TEMPLATES.map((tpl) => (
+            <button
+              key={tpl.key}
+              type="button"
+              className="px-2 py-1 rounded-md text-xs bg-slate-100 text-slate-700 hover:bg-slate-200"
+              onClick={() => {
+                setTitle(tpl.title);
+                setPrompt(tpl.prompt);
+                setCriteriaText(criteriaToText(tpl.criteria));
+              }}
+            >
+              {tpl.label}
+            </button>
+          ))}
+        </div>
+      </div>
       <div>
         <label className="text-xs text-slate-500">Title (one line)</label>
         <input className="input" value={title} onChange={(e) => setTitle(e.target.value)}
@@ -178,6 +247,13 @@ function NewTaskForm({ onCreated, onCancel }) {
                   onChange={(e) => setPrompt(e.target.value)}
                   placeholder="What's the task? What does done look like? Any constraints?" />
         <p className="text-xs text-slate-400 mt-1">Worker sessions start fresh — include all context here.</p>
+      </div>
+      <div>
+        <label className="text-xs text-slate-500">Done contract / acceptance criteria</label>
+        <textarea className="input min-h-[96px] text-xs" value={criteriaText}
+                  onChange={(e) => setCriteriaText(e.target.value)}
+                  placeholder="One requirement per line. The worker self-review checks these before asking for approval." />
+        <p className="text-xs text-slate-400 mt-1">Inspired by Hermes completion contracts: make “done” evidence-based before the task leaves the queue.</p>
       </div>
       <div>
         <label className="text-xs text-slate-500">Priority</label>
@@ -393,6 +469,9 @@ export default function MissionControl() {
     const [summary, setSummary] = useState(null);
     const [showNew, setShowNew] = useState(false);
     const [openId, setOpenId] = useState(null);
+    const [query, setQuery] = useState('');
+    const [sourceFilter, setSourceFilter] = useState('all');
+    const [actingId, setActingId] = useState(null);
     const [error, setError] = useState(null);
     const [now, setNow] = useState(Date.now());
     const [tick, setTick] = useState(0);
@@ -462,6 +541,38 @@ export default function MissionControl() {
   const onCreated = () => { setShowNew(false); reload(); };
   const onChanged = () => { reload(); };
 
+  const visibleItems = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    return list.items.filter((t) => {
+      if (sourceFilter !== 'all' && t.source !== sourceFilter) return false;
+      if (!q) return true;
+      return [t.title, t.uid, t.source, t.result_summary, t.evidence_path]
+        .filter(Boolean)
+        .some((v) => String(v).toLowerCase().includes(q));
+    });
+  }, [list.items, query, sourceFilter]);
+
+  const uniqueSources = useMemo(() => {
+    const src = new Set(list.items.map((t) => t.source).filter(Boolean));
+    return ['all', ...Array.from(src).sort()];
+  }, [list.items]);
+
+  const needsDecision = visibleItems.filter((t) => t.status === 'review' || t.status === 'blocked').length;
+  const runningCount = visibleItems.filter((t) => t.status === 'running').length;
+  const verificationGaps = visibleItems.filter((t) => (t.status === 'review' || t.status === 'blocked') && !t.evidence_path).length;
+
+  const quickApprove = async (taskId) => {
+    setActingId(taskId);
+    try {
+      await postJson(`/agent-tasks/${taskId}/decision`, { action: 'approve', note: 'Approved from Mission Control quick action.' });
+      await reload();
+    } catch (e) {
+      setError(e.response?.data?.error || e.message);
+    } finally {
+      setActingId(null);
+    }
+  };
+
   return (
     <div>
       <div className="flex items-center justify-between mb-4 gap-2 flex-wrap">
@@ -485,19 +596,57 @@ export default function MissionControl() {
       </nav>
 
       {summary && (
-        <div className="grid grid-cols-2 md:grid-cols-7 gap-2 mb-4">
+        <div className="grid grid-cols-1 lg:grid-cols-[1.4fr_1fr] gap-4 mb-4">
+          <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-7 gap-2">
           {['queued', 'running', 'review', 'blocked', 'failed', 'done', 'cancelled'].map((s) => (
             <div key={s} className="card text-center py-2">
               <div className="text-xs text-slate-500 uppercase">{s}</div>
               <div className="text-xl font-bold">{summary[s] ?? 0}</div>
             </div>
           ))}
+          </div>
+          <div className="card p-3 bg-gradient-to-br from-brand-50 to-white border-brand-100">
+            <div className="flex items-center justify-between gap-2">
+              <div>
+                <div className="text-xs uppercase tracking-wide text-brand-700 font-semibold">Operator focus</div>
+                <div className="text-sm text-slate-600 mt-1">Evidence-first queue triage</div>
+              </div>
+              <Activity size={20} className="text-brand-600" />
+            </div>
+            <div className="grid grid-cols-3 gap-2 mt-3 text-center">
+              <div className="rounded-lg bg-white border border-brand-100 p-2">
+                <div className="text-xl font-bold text-brand-700">{needsDecision}</div>
+                <div className="text-[11px] text-slate-500">need decision</div>
+              </div>
+              <div className="rounded-lg bg-white border border-brand-100 p-2">
+                <div className="text-xl font-bold text-yellow-700">{runningCount}</div>
+                <div className="text-[11px] text-slate-500">in flight</div>
+              </div>
+              <div className="rounded-lg bg-white border border-brand-100 p-2">
+                <div className="text-xl font-bold text-red-700">{verificationGaps}</div>
+                <div className="text-[11px] text-slate-500">no evidence</div>
+              </div>
+            </div>
+          </div>
         </div>
       )}
 
       {showNew && <div className="mb-4"><NewTaskForm onCreated={onCreated} onCancel={() => setShowNew(false)} /></div>}
 
-      <div className="card mb-4">
+      <div className="card mb-4 space-y-3">
+        <div className="grid grid-cols-1 md:grid-cols-[1fr_180px] gap-2">
+          <label className="sr-only" htmlFor="mc-search">Search tasks</label>
+          <input
+            id="mc-search"
+            className="input"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search title, uid, source, evidence, summary…"
+          />
+          <select className="input" value={sourceFilter} onChange={(e) => setSourceFilter(e.target.value)}>
+            {uniqueSources.map((src) => <option key={src} value={src}>{src === 'all' ? 'All sources' : src}</option>)}
+          </select>
+        </div>
         <div className="flex gap-1 flex-wrap">
           {STATUS_FILTERS.map((f) => (
             <button key={f.key}
@@ -523,13 +672,14 @@ export default function MissionControl() {
               <th className="py-2 pr-2">Duration</th>
               <th className="py-2 pr-2 min-w-[180px]">Progress</th>
               <th className="py-2 pr-2">Attempts</th>
+              <th className="py-2 pr-2">Action</th>
             </tr>
           </thead>
           <tbody>
-            {list.items.length === 0 && (
-              <tr><td colSpan={8} className="py-6 text-center text-slate-500">No tasks in this view.</td></tr>
+            {visibleItems.length === 0 && (
+              <tr><td colSpan={9} className="py-6 text-center text-slate-500">No tasks match this view.</td></tr>
             )}
-            {list.items.map((t) => {
+            {visibleItems.map((t) => {
               const isNew = !seenIds.has(t.id) && seenIds.size > 0; // skip first poll (no "previous" baseline)
               const isExiting = exitingIds.has(t.id);
               const rowClass = [
@@ -560,6 +710,24 @@ export default function MissionControl() {
                     : <span className="text-slate-400">—</span>}
                 </td>
                 <td className="py-2 pr-2 text-xs">{t.attempts}/{t.max_attempts}</td>
+                <td className="py-2 pr-2 text-xs" onClick={(e) => e.stopPropagation()}>
+                  {t.status === 'review' ? (
+                    <button
+                      className="px-2 py-1 rounded-md bg-green-100 text-green-800 hover:bg-green-200 disabled:opacity-60"
+                      disabled={actingId === t.id}
+                      onClick={() => quickApprove(t.id)}
+                      title="Approve without opening the drawer"
+                    >
+                      {actingId === t.id ? '…' : 'Approve'}
+                    </button>
+                  ) : t.status === 'blocked' ? (
+                    <span className="text-red-600">Open to resolve</span>
+                  ) : t.evidence_path ? (
+                    <span className="text-green-700">evidence</span>
+                  ) : (
+                    <span className="text-slate-400">—</span>
+                  )}
+                </td>
               </tr>
               );
             })}
@@ -569,7 +737,7 @@ export default function MissionControl() {
 
       {list.items.length > 0 && (
         <p className="text-xs text-slate-500 mt-2">
-          Showing {list.items.length} of {list.total}.
+          Showing {visibleItems.length} filtered / {list.items.length} loaded of {list.total}.
         </p>
       )}
 

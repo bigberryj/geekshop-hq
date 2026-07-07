@@ -27,11 +27,11 @@ Built as a deliberate rebuild of the previous `GeekTicket` (a.k.a. `tasktrackert
 ## Mission Control in 30 seconds
 
 1. Open http://localhost:5173/mission-control
-2. Click **+ New task**, give it a title, full prompt (acceptance criteria are auto-inferred if you don't supply any), and submit.
+2. Click **+ New task**, choose a starter template if useful, give it a title, full prompt, and explicit done-contract / acceptance criteria, then submit.
 3. The worker cron picks it up on the next 2-min tick. You can force it with `hermes cron run e6034f45874f`.
    - **Silent by default.** The cron uses `deliver: local`. The worker pings you on Telegram only when a real task is done. Empty queue, rate-limit cooldown, and stuck-requeue ticks produce no message at all — the worker returns `[SILENT]`. This is by design: the system is on a 2-min tick, and the last thing you want is a "nothing to do" message every 2 min.
 4. The worker writes a `result_summary` and a self-review checklist. You see the row go `queued → running → review` in real time. A Telegram ping lands in `@john5wizbot` with the checklist.
-5. Click the row in HQ to **Approve**, **Send back**, or **Cancel**.
+5. Use the search/source filters to find the row. Click it for the full drawer, or use the table's quick **Approve** action for straightforward review tasks.
 
 Telegram shortcut: in the bot chat, type `queue <description>` and the session enqueues it for you.
 

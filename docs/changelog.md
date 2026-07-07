@@ -1,5 +1,29 @@
 # Changelog
 
+## 2026-07-07 — Mission Control evidence-first UX refresh
+
+Latest Hermes Agent release review: v0.18.0 emphasizes evidence-backed completion contracts, background fan-out, `/learn` reusable workflow capture, `/journey` visibility into learned context, MoA as a first-class model option, and cron/kanban reliability hardening. The HQ Mission Control task page now turns the most useful pieces of that into daily operator workflow.
+
+**Frontend (`client/src/pages/MissionControl.jsx`)**
+
+- New Task form now includes an explicit **Done contract / acceptance criteria** field. Each non-empty line is posted as `acceptance_criteria[]`, so workers self-review against concrete evidence instead of implied vibes.
+- Added three starter templates: **Verification contract**, **Parallel research / audit**, and **Capture reusable learning**. They prefill prompt + criteria for the common task types Byron queues into J5.
+- Added an **Operator focus** panel beside the status cards: filtered counts for `need decision`, `in flight`, and `no evidence`.
+- Added client-side search and source filters over the loaded Mission Control rows.
+- Added a table quick-action column: `review` tasks can be approved directly when no extra note is needed; `blocked` tasks still route through the drawer so the operator can leave a requeue/cancel note.
+
+**Docs**
+
+- `README.md` — Mission Control quick-start now mentions templates, explicit done contracts, filters, and quick approval.
+- `docs/api.md` — Mission Control API notes now document the UI contract around `acceptance_criteria`.
+- `docs/mission-control-agents.md` — added the July 2026 evidence-first Tasks page controls.
+
+**Verification**
+
+- `cd client && npm run build` — passed. Vite built 1687 modules; JS bundle warning remains the existing >500 kB chunk warning.
+- `cd server && npm test -- test/agent-tasks.test.js test/agent-tasks-callback.test.js test/agent-tasks-telegram-buttons.test.js` — 31/31 targeted Mission Control tests passed.
+- `cd server && npm test` — existing broader suite still has unrelated failures in tax-summary-enhanced, Stripe webhook mock shape, phase6 generated_at month assumption, and Google Contacts local dependency setup; Mission Control tests passed in that full run.
+
 ## 2026-06-30 — Phase 7 Mission Control inline Telegram buttons (T-61CE00)
 
 Phase 7 of [`docs/plans/2026-06-29-geekshop-hq-accounting-roadmap.md`](./plans/2026-06-29-geekshop-hq-accounting-roadmap.md). Real-task-complete Telegram pings now carry Approve / Requeue / Cancel inline buttons that wire into the existing `/api/agent-tasks/callback` endpoint.
