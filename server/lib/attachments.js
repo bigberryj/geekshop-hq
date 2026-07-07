@@ -28,13 +28,22 @@ import { mkdirSync, writeFileSync, statSync, unlinkSync, existsSync, createReadS
 import { join, dirname, resolve, basename, extname } from 'node:path';
 import { homedir } from 'node:os';
 
-const ATTACHMENT_ROOT = process.env.GHQ_ATTACHMENT_ROOT
-  ? resolve(process.env.GHQ_ATTACHMENT_ROOT)
-  : join(homedir(), 'projects', 'geekshop-hq', 'data', 'attachments');
+// Phase 4 — ATTACHMENT_ROOT is re-evaluated on every read so test
+// isolation works (vitest hoists imports, so any env-driven override
+// has to be honoured at request time, not at module-load time).
+// Default: ~/.../data/attachments.
+function getAttachmentRoot() {
+  return process.env.GHQ_ATTACHMENT_ROOT
+    ? resolve(process.env.GHQ_ATTACHMENT_ROOT)
+    : join(homedir(), 'projects', 'geekshop-hq', 'data', 'attachments');
+}
 
 const MAX_BYTES = 25 * 1024 * 1024;
 
-export const attachmentConstants = { ATTACHMENT_ROOT, MAX_BYTES };
+export const attachmentConstants = {
+  get ATTACHMENT_ROOT() { return getAttachmentRoot(); },
+  MAX_BYTES,
+};
 
 function safeFilename(name) {
   // Strip path components + control chars, keep the extension. Fall
@@ -49,8 +58,8 @@ function shortHash(buf) {
 }
 
 function bucketFor(scope, id) {
-  // 'pending' or 'tickets'
-  return join(ATTACHMENT_ROOT, scope, String(id));
+  // 'pending', 'tickets', or 'expenses'
+  return join(getAttachmentRoot(), scope, String(id));
 }
 
 /**
@@ -96,16 +105,115 @@ export function persistAttachment({ scope, rowId, filename, mimeType, buffer, co
 }
 
 /**
+ * Phase 4 — Receipt allowlist.
+ *
+ * Returns true if the given (mime, first-bytes) combination is on the
+ * allowlist for receipt uploads. The allowlist is intentionally narrow:
+ *
+ *   - image/png  (header: 89 50 4E 47)
+ *   - image/jpeg (header: FF D8 FF)
+ *   - image/webp (RIFF....WEBP)
+ *   - application/pdf (header: 25 50 44 46 — "%PDF")
+ *
+ * Why both mime and content sniff? `file.mimetype` comes from the client
+ * and is fully attacker-controlled. A malicious browser could send a
+ * .exe with mime=image/png and a PNG-shaped first 4 bytes. We check
+ * both: the server rejects mismatches with `RECEIPT_TYPE_REJECTED`
+ * before the bytes ever touch disk. The hard-coded sniff set is small
+ * enough to maintain by hand and covers the only formats the HQ UI
+ * currently advertises in the file picker (`accept="image/*,application/pdf"`).
+ *
+ * Adding a new format: extend the SNIFF_BYTES table AND update the
+ * Phase 4 docs (schema.md, api.md, security.md, changelog.md).
+ */
+const RECEIPT_ALLOWED_MIMES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/webp',
+  'application/pdf',
+]);
+
+export const RECEIPT_MAX_BYTES = 25 * 1024 * 1024; // 25 MB, same as the global cap
+
+export function isReceiptMimeAllowed(mime) {
+  if (!mime || typeof mime !== 'string') return false;
+  // Normalize (some browsers send "image/jpg" or "image/JPEG").
+  return RECEIPT_ALLOWED_MIMES.has(mime.toLowerCase());
+}
+
+const SIG_PNG  = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]); // ‰PNG....
+const SIG_JPEG = Buffer.from([0xFF, 0xD8, 0xFF]);
+const SIG_PDF  = Buffer.from([0x25, 0x50, 0x44, 0x46]); // %PDF
+const SIG_WEBP_RIFF = Buffer.from('RIFF', 'ascii');
+const SIG_WEBP_WEBP = Buffer.from('WEBP', 'ascii');
+
+function startsWith(buf, sig) {
+  if (!buf || buf.length < sig.length) return false;
+  return buf.subarray(0, sig.length).equals(sig);
+}
+
+/**
+ * Sniff the file type from the first bytes. Returns the canonical mime
+ * (one of the four in RECEIPT_ALLOWED_MIMES) or null if the content
+ * doesn't match any known signature. PDF detection is intentionally
+ * first so the %PDF header is never confused with a PNG/JPEG hex match.
+ */
+export function sniffReceiptMime(buffer) {
+  if (!buffer || !buffer.length) return null;
+  if (startsWith(buffer, SIG_PNG))  return 'image/png';
+  if (startsWith(buffer, SIG_PDF))  return 'application/pdf';
+  if (startsWith(buffer, SIG_JPEG)) return 'image/jpeg';
+  // WebP: "RIFF????WEBP"
+  if (buffer.length >= 12
+      && startsWith(buffer, SIG_WEBP_RIFF)
+      && buffer.subarray(8, 12).equals(SIG_WEBP_WEBP)) {
+    return 'image/webp';
+  }
+  return null;
+}
+
+/**
+ * Combined check used by the upload route. Returns:
+ *   { ok: true,  mime: 'image/png' }              — passed; mime is the
+ *                                                    canonical sniffed type
+ *   { ok: false, code: 'MIME_NOT_ALLOWED' }       — declared mime not in list
+ *   { ok: false, code: 'TYPE_MISMATCH' }           — declared vs sniffed differ
+ *   { ok: false, code: 'CONTENT_UNKNOWN' }        — no signature matched
+ *
+ * The route should turn a non-ok result into a 415 (Unsupported Media
+ * Type) so the failure mode is loud and debuggable.
+ */
+export function checkReceiptUpload({ declaredMime, buffer }) {
+  if (!isReceiptMimeAllowed(declaredMime)) {
+    return { ok: false, code: 'MIME_NOT_ALLOWED' };
+  }
+  const sniffed = sniffReceiptMime(buffer);
+  if (!sniffed) {
+    return { ok: false, code: 'CONTENT_UNKNOWN' };
+  }
+  // Compare by base type. e.g. "image/jpeg" matches a JPEG sniff even
+  // if the client declared "image/jpg" (some browsers are sloppy).
+  const declaredBase = declaredMime.toLowerCase().split('/')[1];
+  const sniffedBase = sniffed.split('/')[1];
+  const mimeAlias = (a) => (a === 'jpg' ? 'jpeg' : a);
+  if (mimeAlias(declaredBase) !== mimeAlias(sniffedBase)) {
+    return { ok: false, code: 'TYPE_MISMATCH' };
+  }
+  return { ok: true, mime: sniffed };
+}
+
+/**
  * Resolve a relative storage_path (from the DB) to an absolute path on
  * disk, scoped to ATTACHMENT_ROOT. Rejects any path that escapes the
  * root (path-traversal guard).
  */
 export function resolveAttachmentPath(storagePath) {
   if (!storagePath || typeof storagePath !== 'string') return null;
-  const abs = resolve(ATTACHMENT_ROOT, storagePath);
-  // Ensure the resolved path is still under ATTACHMENT_ROOT.
-  const root = ATTACHMENT_ROOT.endsWith('/') ? ATTACHMENT_ROOT : ATTACHMENT_ROOT + '/';
-  if (!abs.startsWith(root) && abs !== ATTACHMENT_ROOT) return null;
+  const root = getAttachmentRoot();
+  const abs = resolve(root, storagePath);
+  // Ensure the resolved path is still under the (current) root.
+  const rootWithSep = root.endsWith('/') ? root : root + '/';
+  if (!abs.startsWith(rootWithSep) && abs !== root) return null;
   if (!existsSync(abs)) return null;
   return abs;
 }
@@ -212,4 +320,4 @@ export function sanitizeEmailHtml(html, cidToAttachmentId) {
   return s;
 }
 
-export { ATTACHMENT_ROOT, MAX_BYTES as ATTACHMENT_MAX_BYTES };
+export { getAttachmentRoot as getAttachmentRootFn, MAX_BYTES as ATTACHMENT_MAX_BYTES };

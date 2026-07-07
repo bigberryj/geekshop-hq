@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { useParams, Link } from 'react-router-dom';
 import { fetchJson, postJson, putJson, delJson, formatDuration, formatMoney } from '../lib/api.js';
 import { Sparkles, Plus, Trash2, Pencil, X, Check, Loader2 } from 'lucide-react';
+import CustomerTimeline from '../components/CustomerTimeline.jsx';
 
 const CATEGORIES = ['preference', 'equipment', 'history', 'relationship', 'note'];
 
@@ -62,20 +63,20 @@ function EditableContact({ customer, onSaved }) {
     return (
       <div className="mt-2 mb-6">
         <div className="flex items-start justify-between gap-2">
-          <div className="min-w-0">
-            <h2 className="text-2xl font-bold">{customer.name}</h2>
-            <div className="text-sm text-slate-500 mt-1">
+          <div className="min-w-0 flex-1">
+            <h2 className="text-2xl font-bold break-words">{customer.name}</h2>
+            <div className="text-sm text-slate-500 mt-1 break-words">
               {[
                 customer.company,
                 customer.email,
                 customer.phone,
               ].filter(Boolean).join(' · ') || <span className="italic text-slate-400">no contact info yet</span>}
             </div>
-            {customer.notes && <p className="text-sm text-slate-700 mt-2 whitespace-pre-wrap">{customer.notes}</p>}
+            {customer.notes && <p className="text-sm text-slate-700 mt-2 whitespace-pre-wrap break-words">{customer.notes}</p>}
           </div>
           <button
             onClick={start}
-            className="btn-secondary text-xs shrink-0"
+            className="btn-secondary text-xs shrink-0 tap-target"
             data-testid="customer-edit-btn"
             title="Edit contact info"
           >
@@ -101,7 +102,7 @@ function EditableContact({ customer, onSaved }) {
         </div>
       </div>
       {error && <div className="text-xs text-red-700 bg-red-50 border border-red-200 rounded p-2 mb-2">{error}</div>}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         <label className="text-xs">
           <span className="text-slate-500">Name *</span>
           <input className="input mt-1" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} required data-testid="customer-edit-name" />
@@ -130,7 +131,7 @@ function EditableContact({ customer, onSaved }) {
 export default function CustomerDetail() {
   const { id } = useParams();
   const [c, setC] = useState(null);
-  const [tab, setTab] = useState('tickets');
+  const [tab, setTab] = useState('timeline');
   const [newMem, setNewMem] = useState({ category: 'note', key: '', value: '' });
   const [extractText, setExtractText] = useState('');
   const [extracting, setExtracting] = useState(false);
@@ -172,14 +173,30 @@ export default function CustomerDetail() {
         <span className="badge-slate mr-2">Total time: {formatDuration(c.total_time_seconds)}</span>
       </div>
 
-      <div className="flex gap-2 border-b border-slate-200 mb-4">
-        {['tickets', 'memory', 'invoices'].map((t) => (
-          <button key={t} onClick={() => setTab(t)} className={`px-4 py-2 text-sm font-medium border-b-2 ${tab === t ? 'border-brand-600 text-brand-600' : 'border-transparent text-slate-500'}`}>
-            {t.charAt(0).toUpperCase() + t.slice(1)}
-            {t === 'memory' && c.memory.length > 0 && <span className="ml-1 text-xs text-slate-400">({c.memory.length})</span>}
-          </button>
-        ))}
+      <div className="-mx-4 md:mx-0 overflow-x-auto">
+        <div className="flex gap-2 border-b border-slate-200 mb-4 px-4 md:px-0 min-w-max">
+          {[
+            { key: 'timeline', label: 'Timeline' },
+            { key: 'tickets', label: 'Tickets' },
+            { key: 'memory', label: 'Memory' },
+            { key: 'invoices', label: 'Invoices' },
+          ].map((t) => (
+            <button
+              key={t.key}
+              onClick={() => setTab(t.key)}
+              data-testid={`customer-tab-${t.key}`}
+              className={`px-4 py-2 text-sm font-medium border-b-2 whitespace-nowrap ${tab === t.key ? 'border-brand-600 text-brand-600' : 'border-transparent text-slate-500'}`}
+            >
+              {t.label}
+              {t.key === 'memory' && c.memory.length > 0 && <span className="ml-1 text-xs text-slate-400">({c.memory.length})</span>}
+            </button>
+          ))}
+        </div>
       </div>
+
+      {tab === 'timeline' && (
+        <CustomerTimeline customerId={id} />
+      )}
 
       {tab === 'tickets' && (
         <div className="card">
@@ -198,14 +215,14 @@ export default function CustomerDetail() {
 
       {tab === 'memory' && (
         <div className="space-y-4">
-          <form onSubmit={addMemory} className="card grid grid-cols-3 gap-2">
+          <form onSubmit={addMemory} className="card grid grid-cols-1 sm:grid-cols-3 gap-2">
             <select className="input" value={newMem.category} onChange={(e) => setNewMem({ ...newMem, category: e.target.value })}>
               {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
             </select>
             <input className="input" placeholder="key (optional)" value={newMem.key} onChange={(e) => setNewMem({ ...newMem, key: e.target.value })} />
             <div className="flex gap-2">
               <input className="input flex-1" placeholder="value" value={newMem.value} onChange={(e) => setNewMem({ ...newMem, value: e.target.value })} required />
-              <button className="btn-primary" type="submit"><Plus size={14} /></button>
+              <button className="btn-primary tap-target" type="submit"><Plus size={14} /></button>
             </div>
           </form>
 

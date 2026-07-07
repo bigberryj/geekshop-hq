@@ -255,14 +255,8 @@ export async function getRoster(db, env = process.env) {
   };
 }
 
-/**
- * Send a message to a gateway's Telegram bot. Requires the bot token in env.
- * Returns { ok, message_id, chat_id } or { ok: false, error }.
- *
- * Currently delegates to the Telegram Bot API directly. Future versions
- * could route through the hermes gateway's sendMessage tool.
- */
-export async function sendAgentMessage(agentId, text, env = process.env) {
+/**\n * Send a message to a gateway's Telegram bot. Requires the bot token in env.\n * Returns { ok, message_id, chat_id } or { ok: false, error }.\n *\n * Currently delegates to the Telegram Bot API directly. Future versions\n * could route through the hermes gateway's sendMessage tool.\n */
+export async function sendAgentMessage(agentId, text, opts = {}, env = process.env) {
   const handle = agentId === 'default' ? '@john5wizbot' : agentId === 'minimax' ? '@john5minimaxbot' : null;
   if (!handle) return { ok: false, error: `agent ${agentId} has no Telegram handle` };
   const { token, chatId, threadId } = await getTelegramConfig(agentId, env);
@@ -271,15 +265,18 @@ export async function sendAgentMessage(agentId, text, env = process.env) {
 
   const url = `https://api.telegram.org/bot${token}/sendMessage`;
   try {
+    const payload = {
+      chat_id: chatId,
+      ...(threadId ? { message_thread_id: Number(threadId) } : {}),
+      text,
+      parse_mode: 'HTML',
+      ...(opts.reply_markup ? { reply_markup: opts.reply_markup } : {}),
+    };
+
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        ...(threadId ? { message_thread_id: Number(threadId) } : {}),
-        text,
-        parse_mode: 'HTML',
-      }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json();
     if (!data.ok) return { ok: false, error: data.description || 'Telegram API error' };
@@ -292,4 +289,23 @@ export async function sendAgentMessage(agentId, text, env = process.env) {
   } catch (e) {
     return { ok: false, error: e.message };
   }
+}
+
+/**
+ * Send a message with inline buttons for task approval.
+ *
+ * @param {string} agentId - The agent ID (default, minimax, etc.)
+ * @param {string} text - The message text
+ * @param {Array} buttons - Array of button objects with text and callback_data
+ * @param {object} env - Environment variables
+ * @returns {Promise<object>} - Result of the send operation
+ */
+export async function sendAgentMessageWithButtons(agentId, text, buttons, env = process.env) {
+  const reply_markup = {
+    inline_keyboard: buttons.map(row =>
+      Array.isArray(row) ? row : [row]
+    )
+  };
+
+  return sendAgentMessage(agentId, text, { reply_markup }, env);
 }

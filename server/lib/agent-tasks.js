@@ -213,7 +213,7 @@ export function finishTask(db, id, patch) {
   if (result.changes > 0) {
     setImmediate(async () => {
       try {
-        const { notifyTaskTerminal } = await import('./notify.js');
+        const { notifyTaskTerminal, notifyTaskForApproval } = await import('./notify.js');
         // Re-open a fresh connection for the post-commit read.
         const Database = (await import('better-sqlite3')).default;
         const { getTask } = await import('./agent-tasks.js');
@@ -221,7 +221,15 @@ export function finishTask(db, id, patch) {
         const freshDb = new Database(path);
         try {
           const fresh = getTask(freshDb, id);
-          if (fresh) await notifyTaskTerminal(fresh);
+          if (fresh) {
+            // Send email notification for all terminal statuses
+            await notifyTaskTerminal(fresh);
+
+            // Send Telegram notification with buttons for review status
+            if (fresh.status === 'review') {
+              await notifyTaskForApproval(fresh);
+            }
+          }
         } finally {
           freshDb.close();
         }

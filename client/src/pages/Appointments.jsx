@@ -1,5 +1,12 @@
 import { useEffect, useState } from 'react';
 import { fetchJson, postJson, patchJson } from '../lib/api.js';
+import PageHeader from '../components/PageHeader.jsx';
+import DataTable from '../components/DataTable.jsx';
+import { Plus, X } from 'lucide-react';
+
+function statusBadge(status) {
+  return `badge-${status === 'confirmed' ? 'green' : status === 'completed' ? 'slate' : 'yellow'}`;
+}
 
 export default function Appointments() {
   const [appts, setAppts] = useState([]);
@@ -22,52 +29,83 @@ export default function Appointments() {
     load();
   };
 
+  const columns = [
+    {
+      key: 'starts_at',
+      header: 'When',
+      primary: true,
+      render: (a) => <span className="text-xs">{new Date(a.starts_at).toLocaleString()}</span>,
+    },
+    { key: 'customer_name', header: 'Customer', hideOnMobile: true, render: (a) => a.customer_name || '—' },
+    { key: 'notes', header: 'Notes', hideOnMobile: true, render: (a) => <span className="text-slate-500 text-xs break-words">{a.notes || '—'}</span> },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (a) => <span className={statusBadge(a.status)}>{a.status}</span>,
+    },
+    {
+      key: 'actions',
+      header: '',
+      align: 'right',
+      render: (a) => (
+        <div className="flex flex-wrap justify-end gap-1">
+          {a.status === 'scheduled' && (
+            <button className="btn-ghost text-xs tap-target" onClick={() => setStatus(a.id, 'confirmed')}>Confirm</button>
+          )}
+          {a.status !== 'completed' && (
+            <button className="btn-ghost text-xs tap-target" onClick={() => setStatus(a.id, 'completed')}>Complete</button>
+          )}
+        </div>
+      ),
+    },
+  ];
+
   return (
     <div>
-      <div className="flex items-center justify-between mb-6">
-        <h2 className="text-2xl font-bold">Appointments</h2>
-        <button className="btn-primary" onClick={() => setShowNew(!showNew)}>{showNew ? 'Cancel' : '+ New'}</button>
-      </div>
+      <PageHeader
+        title="Appointments"
+        actions={
+          <button className="btn-primary tap-target" onClick={() => setShowNew((s) => !s)}>
+            {showNew ? (<><X size={14} /> Cancel</>) : (<><Plus size={14} /> New</>)}
+          </button>
+        }
+      />
 
       {showNew && (
-        <form onSubmit={create} className="card mb-4 grid grid-cols-2 gap-3">
-          <div><label className="label">Customer name</label><input className="input" value={form.customer_name} onChange={(e) => setForm({ ...form, customer_name: e.target.value })} required /></div>
-          <div><label className="label">Customer email</label><input className="input" type="email" value={form.customer_email} onChange={(e) => setForm({ ...form, customer_email: e.target.value })} required /></div>
-          <div><label className="label">Starts at</label><input className="input" type="datetime-local" value={form.starts_at} onChange={(e) => setForm({ ...form, starts_at: e.target.value })} required /></div>
-          <div><label className="label">Ends at</label><input className="input" type="datetime-local" value={form.ends_at} onChange={(e) => setForm({ ...form, ends_at: e.target.value })} required /></div>
-          <div className="col-span-2"><label className="label">Notes</label><input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} /></div>
-          <div className="col-span-2"><button className="btn-primary" type="submit">Create</button></div>
+        <form onSubmit={create} className="card mb-4 grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <label className="label">Customer name</label>
+            <input className="input" value={form.customer_name} onChange={(e) => setForm({ ...form, customer_name: e.target.value })} required />
+          </div>
+          <div>
+            <label className="label">Customer email</label>
+            <input className="input" type="email" value={form.customer_email} onChange={(e) => setForm({ ...form, customer_email: e.target.value })} required />
+          </div>
+          <div>
+            <label className="label">Starts at</label>
+            <input className="input" type="datetime-local" value={form.starts_at} onChange={(e) => setForm({ ...form, starts_at: e.target.value })} required />
+          </div>
+          <div>
+            <label className="label">Ends at</label>
+            <input className="input" type="datetime-local" value={form.ends_at} onChange={(e) => setForm({ ...form, ends_at: e.target.value })} required />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="label">Notes</label>
+            <input className="input" value={form.notes} onChange={(e) => setForm({ ...form, notes: e.target.value })} />
+          </div>
+          <div className="sm:col-span-2 flex flex-wrap gap-2">
+            <button className="btn-primary tap-target" type="submit">Create appointment</button>
+            <button className="btn-secondary tap-target" type="button" onClick={() => setShowNew(false)}>Cancel</button>
+          </div>
         </form>
       )}
 
-      <div className="card overflow-hidden p-0">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left">
-            <tr>
-              <th className="px-3 py-2">When</th>
-              <th className="px-3 py-2">Customer</th>
-              <th className="px-3 py-2">Notes</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {appts.map((a) => (
-              <tr key={a.id} className="border-t">
-                <td className="px-3 py-2 text-xs">{new Date(a.starts_at).toLocaleString()}</td>
-                <td className="px-3 py-2">{a.customer_name || '—'}</td>
-                <td className="px-3 py-2 text-slate-500 text-xs">{a.notes || '—'}</td>
-                <td className="px-3 py-2"><span className={`badge-${a.status === 'confirmed' ? 'green' : a.status === 'completed' ? 'slate' : 'yellow'}`}>{a.status}</span></td>
-                <td className="px-3 py-2 text-right">
-                  {a.status === 'scheduled' && <button className="btn-ghost text-xs" onClick={() => setStatus(a.id, 'confirmed')}>Confirm</button>}
-                  {a.status !== 'completed' && <button className="btn-ghost text-xs" onClick={() => setStatus(a.id, 'completed')}>Complete</button>}
-                </td>
-              </tr>
-            ))}
-            {appts.length === 0 && <tr><td colSpan="5" className="px-3 py-4 text-center text-slate-500">No appointments</td></tr>}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={columns}
+        rows={appts}
+        rowKey="id"
+        empty="No appointments yet."
+      />
     </div>
   );
 }

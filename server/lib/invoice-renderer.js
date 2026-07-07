@@ -8,7 +8,15 @@ function money(cents = 0) {
 }
 
 function lineTotalCents(li) {
-  return Math.round((Number(li.qty) || 1) * (Number(li.unit_price) || 0));
+  // Prefer the pre-computed integer total when present (the Accounting
+  // editor stores `total_cents` and the legacy draft-from-time path
+  // stores it too after the private floor boost). Fall back to
+  // qty * unit_price (legacy `qty`/`unit_price` keys, also normalised).
+  const pre = Number(li?.total_cents);
+  if (Number.isFinite(pre)) return Math.round(pre);
+  const q = Number(li?.qty ?? li?.quantity ?? 1);
+  const p = Number(li?.unit_price ?? li?.unit_price_cents ?? 0);
+  return Math.round(q * p);
 }
 
 function esc(value) {

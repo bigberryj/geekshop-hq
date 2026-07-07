@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { fetchJson, formatMoney, postJson } from '../lib/api.js';
 import InvoiceDraftModal from '../components/InvoiceDraftModal.jsx';
+import PageHeader from '../components/PageHeader.jsx';
+import DataTable from '../components/DataTable.jsx';
 
 export default function Money() {
   const [summary, setSummary] = useState(null);
@@ -46,9 +48,68 @@ export default function Money() {
   const rate = summary.labour_rate_cents_per_hour ?? 10000;
   const ratePerHour = (rate / 100).toFixed(2);
 
+  const invoiceStatusBadge = (status) => {
+    if (status === 'paid') return 'badge-green';
+    if (status === 'overdue') return 'badge-red';
+    if (status === 'draft') return 'badge-slate';
+    return 'badge-yellow';
+  };
+
+  const invoiceColumns = [
+    {
+      key: 'invoice_uid',
+      header: 'ID',
+      primary: true,
+      render: (i) => <span className="font-mono text-xs">{i.invoice_uid}</span>,
+    },
+    { key: 'customer_name', header: 'Customer', hideOnMobile: true },
+    {
+      key: 'status',
+      header: 'Status',
+      render: (i) => <span className={invoiceStatusBadge(i.status)}>{i.status}</span>,
+    },
+    { key: 'subtotal_cents', header: 'Subtotal', hideOnMobile: true, align: 'right', render: (i) => <span className="font-mono">{formatMoney(i.subtotal_cents)}</span> },
+    { key: 'tax_cents',      header: 'Tax',      hideOnMobile: true, align: 'right', render: (i) => <span className="font-mono text-slate-600">{formatMoney(i.tax_cents)}</span> },
+    { key: 'total_cents',    header: 'Total',    align: 'right', render: (i) => <span className="font-mono font-semibold">{formatMoney(i.total_cents)}</span> },
+    { key: 'due_at',         header: 'Due',      hideOnMobile: true, render: (i) => <span className="text-xs">{i.due_at || '—'}</span> },
+    {
+      key: 'actions',
+      header: '',
+      align: 'right',
+      render: (i) => (
+        <div className="flex flex-wrap justify-end gap-1">
+          <a className="btn-ghost text-xs tap-target" href={`/api/invoices/${i.id}/print`} target="_blank" rel="noreferrer">Print/PDF</a>
+          {i.status === 'draft' && (
+            <button
+              className="btn-ghost text-xs tap-target"
+              onClick={async () => { await postJson(`/invoices/${i.id}/send`, {}); load(); }}
+            >
+              Send
+            </button>
+          )}
+          {i.status !== 'paid' && i.status !== 'draft' && (
+            <button
+              className="btn-ghost text-xs tap-target"
+              onClick={async () => { await postJson(`/invoices/${i.id}/paid`, {}); load(); }}
+            >
+              Mark paid
+            </button>
+          )}
+        </div>
+      ),
+    },
+  ];
+
+  const timeRevenueColumns = [
+    { key: 'customer_name', header: 'Customer', primary: true, render: (r) => r.customer_name },
+    { key: 'total_hours', header: 'Hours', align: 'right', render: (r) => <span className="font-mono">{r.total_hours}h</span> },
+    { key: 'ticket_count', header: 'Tickets', align: 'right', hideOnMobile: true, render: (r) => r.ticket_count },
+    { key: 'estimated_revenue_cents', header: 'Est. revenue', align: 'right', render: (r) => <span className="font-mono">{formatMoney(r.estimated_revenue_cents)}</span> },
+  ];
+
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-6">Money</h2>
+      <PageHeader title="Money" />
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <Tile label="Outstanding" value={formatMoney(summary.outstanding.total)} sub={`${summary.outstanding.count} invoice(s)`} color="text-yellow-600" />
@@ -60,8 +121,8 @@ export default function Money() {
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
         <section className="card">
           <h3 className="font-semibold mb-2">Billing settings</h3>
-          <div className="text-sm">
-            <div><span className="text-slate-500">Default tax model:</span> <span className="font-mono">{summary.default_tax_model || 'gst_pst_bc'}</span></div>
+          <div className="text-sm space-y-1">
+            <div><span className="text-slate-500">Default tax model:</span> <span className="font-mono break-all">{summary.default_tax_model || 'gst_pst_bc'}</span></div>
             <div><span className="text-slate-500">Labour rate:</span> ${ratePerHour}/hr</div>
             <p className="text-xs text-slate-500 mt-2">Change in <a className="text-brand-600 hover:underline" href="/settings">Settings → Billing & tax</a>.</p>
           </div>
@@ -78,7 +139,7 @@ export default function Money() {
             {customers.map((c) => (
               <button
                 key={c.id}
-                className="btn-secondary text-xs"
+                className="btn-secondary text-xs tap-target"
                 onClick={() => draftFromTime(c.id)}
                 disabled={busy}
               >
@@ -90,62 +151,22 @@ export default function Money() {
       </div>
 
       <h3 className="font-semibold mb-2">Invoices</h3>
-      <div className="card overflow-hidden p-0 mb-6">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left">
-            <tr>
-              <th className="px-3 py-2">ID</th>
-              <th className="px-3 py-2">Customer</th>
-              <th className="px-3 py-2">Status</th>
-              <th className="px-3 py-2">Subtotal</th>
-              <th className="px-3 py-2">Tax</th>
-              <th className="px-3 py-2">Total</th>
-              <th className="px-3 py-2">Due</th>
-              <th className="px-3 py-2"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {invoices.map((i) => (
-              <tr key={i.id} className="border-t">
-                <td className="px-3 py-2 font-mono text-xs">{i.invoice_uid}</td>
-                <td className="px-3 py-2">{i.customer_name}</td>
-                <td className="px-3 py-2"><span className={`badge-${i.status === 'paid' ? 'green' : i.status === 'overdue' ? 'red' : i.status === 'draft' ? 'slate' : 'yellow'}`}>{i.status}</span></td>
-                <td className="px-3 py-2 font-mono">{formatMoney(i.subtotal_cents)}</td>
-                <td className="px-3 py-2 font-mono text-slate-600">{formatMoney(i.tax_cents)}</td>
-                <td className="px-3 py-2 font-mono font-semibold">{formatMoney(i.total_cents)}</td>
-                <td className="px-3 py-2 text-xs">{i.due_at || '—'}</td>
-                <td className="px-3 py-2 text-right">
-                  <a className="btn-ghost text-xs" href={`/api/invoices/${i.id}/print`} target="_blank" rel="noreferrer">Print/PDF</a>
-                  {i.status === 'draft' && <button className="btn-ghost text-xs" onClick={async () => { await postJson(`/invoices/${i.id}/send`, {}); load(); }}>Send</button>}
-                  {i.status !== 'paid' && i.status !== 'draft' && <button className="btn-ghost text-xs" onClick={async () => { await postJson(`/invoices/${i.id}/paid`, {}); load(); }}>Mark paid</button>}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        columns={invoiceColumns}
+        rows={invoices}
+        rowKey="id"
+        empty="No invoices yet."
+        cardClassName="text-sm"
+      />
 
-      <h3 className="font-semibold mb-2">Time revenue (last 30 days)</h3>
+      <h3 className="font-semibold mb-2 mt-6">Time revenue (last 30 days)</h3>
       <p className="text-xs text-slate-500 mb-2">At ${ratePerHour}/hr (your configured rate).</p>
-      <div className="card">
-        {!timeRevenue || timeRevenue.rows.length === 0 ? <p className="text-slate-500 text-sm">No time tracked yet.</p> : (
-          <table className="w-full text-sm">
-            <thead className="text-left text-xs text-slate-500">
-              <tr><th>Customer</th><th>Hours</th><th>Tickets</th><th>Est. revenue</th></tr>
-            </thead>
-            <tbody>
-              {timeRevenue.rows.map((r) => (
-                <tr key={r.customer_id} className="border-t">
-                  <td className="py-1.5">{r.customer_name}</td>
-                  <td>{r.total_hours}h</td>
-                  <td>{r.ticket_count}</td>
-                  <td className="font-mono">{formatMoney(r.estimated_revenue_cents)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
+      <DataTable
+        columns={timeRevenueColumns}
+        rows={timeRevenue?.rows || []}
+        rowKey="customer_id"
+        empty="No time tracked yet."
+      />
 
       {draftFor && (
         <InvoiceDraftModal

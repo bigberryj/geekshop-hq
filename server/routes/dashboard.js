@@ -50,12 +50,13 @@ export async function dashboardRoutes(app) {
 
     const { source } = req.query;
 
-    // Open tickets
+    // Open tickets — soft-deleted rows are excluded so the Inbox
+    // count and list only show tickets Byron is actually working.
     let openTicketSql = `
       SELECT t.id, t.ticket_uid, t.subject, t.priority, t.status, t.source, t.source_message_id, t.last_message_at,
              c.name as customer_name, c.id as customer_id
       FROM tickets t JOIN customers c ON t.customer_id = c.id
-      WHERE t.status != 'resolved'
+      WHERE t.status != 'resolved' AND t.deleted_at IS NULL
     `;
     const openTicketArgs = [];
     if (source && ['email', 'manual', 'booking'].includes(source)) {

@@ -372,12 +372,13 @@ export default function GmailReviewQueue({ onImported }) {
 
   return (
     <section className="card md:col-span-2 border-l-4 border-amber-400">
-      <div className="flex items-center justify-between gap-3 mb-3">
-        <h3 className="font-semibold flex items-center gap-2">
-          <Mail size={16} /> Gmail review queue
-          {visiblePending && <span className="text-xs text-slate-500 font-normal">({visiblePending.length}{visibleTotal > visiblePending.length ? ` of ${visibleTotal}` : ''} pending{pending && visiblePending.length < pending.length ? ` (${pending.length - visiblePending.length} agent mail hidden)` : ''})</span>}
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mb-3">
+        <h3 className="font-semibold flex items-center gap-2 min-w-0">
+          <Mail size={16} className="shrink-0" />
+          <span className="sm:truncate">Gmail review queue</span>
+          {visiblePending && <span className="text-xs text-slate-500 font-normal hidden sm:inline truncate">({visiblePending.length}{visibleTotal > visiblePending.length ? ` of ${visibleTotal}` : ''} pending{pending && visiblePending.length < pending.length ? ` (${pending.length - visiblePending.length} agent mail hidden)` : ''})</span>}
         </h3>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           {/* "Show dismissed" toggle — when on, both pending and dismissed
               rows are shown, with a status badge and Restore button. */}
           <label className="flex items-center gap-1 text-xs cursor-pointer" data-testid="show-dismissed-toggle">
@@ -402,7 +403,7 @@ export default function GmailReviewQueue({ onImported }) {
               on any legacy pending rows that don't have a classification
               yet. Safe to re-run; idempotent. */}
           <button
-            className="btn-ghost text-xs flex items-center gap-1"
+            className="btn-ghost text-xs flex items-center gap-1 tap-target"
             onClick={() => backfill(0.8)}
             disabled={backfillBusy}
             data-testid="backfill-classify-btn"
@@ -413,7 +414,7 @@ export default function GmailReviewQueue({ onImported }) {
           </button>
           {selectedIds.size > 0 && (
             <button
-              className="btn-secondary text-xs flex items-center gap-1"
+              className="btn-secondary text-xs flex items-center gap-1 tap-target"
               onClick={bulkDismiss}
               disabled={bulkBusy}
               data-testid="bulk-dismiss-btn"
@@ -422,7 +423,7 @@ export default function GmailReviewQueue({ onImported }) {
               {bulkBusy ? 'Dismissing…' : `Dismiss ${selectedIds.size} selected`}
             </button>
           )}
-          <button className="btn-secondary text-xs flex items-center gap-1" onClick={scan} disabled={scanning}>
+          <button className="btn-secondary text-xs flex items-center gap-1 tap-target" onClick={scan} disabled={scanning}>
             {scanning ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
             {scanning ? 'Scanning…' : 'Scan Gmail now'}
           </button>
@@ -431,12 +432,12 @@ export default function GmailReviewQueue({ onImported }) {
 
       <div className="flex flex-wrap items-center gap-2 mb-3 text-xs">
         <span className="text-slate-500">Window:</span>
-        <div className="inline-flex rounded border border-slate-200 overflow-hidden">
+        <div className="inline-flex flex-wrap rounded border border-slate-200 overflow-hidden">
           {RANGE_PRESETS.map((p) => (
             <button
               key={p.key}
               onClick={() => setRange(p.key)}
-              className={`px-2 py-1 ${range === p.key ? 'bg-amber-100 text-amber-800 font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              className={`px-2 py-1 tap-target ${range === p.key ? 'bg-amber-100 text-amber-800 font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
               data-testid={`range-${p.key}`}
             >
               {p.label}
@@ -496,12 +497,12 @@ export default function GmailReviewQueue({ onImported }) {
 
       <div className="flex flex-wrap items-center gap-2 mb-3 text-xs" data-testid="display-filter">
         <span className="text-slate-500">Showing:</span>
-        <div className="inline-flex rounded border border-slate-200 overflow-hidden">
+        <div className="inline-flex flex-wrap rounded border border-slate-200 overflow-hidden">
           {FILTER_PRESETS.map((p) => (
             <button
               key={p.key}
               onClick={() => setFilterRange(p.key)}
-              className={`px-2 py-1 ${filterRange === p.key ? 'bg-slate-200 text-slate-800 font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
+              className={`px-2 py-1 tap-target ${filterRange === p.key ? 'bg-slate-200 text-slate-800 font-medium' : 'bg-white text-slate-600 hover:bg-slate-50'}`}
               data-testid={`filter-${p.key}`}
             >
               {p.label}
@@ -530,7 +531,7 @@ export default function GmailReviewQueue({ onImported }) {
         <ul className="space-y-2">
           {visiblePending.map((p) => (
             <li key={p.id} className={`border rounded p-3 ${p.status === 'dismissed' ? 'border-slate-200 bg-slate-50 opacity-80' : 'border-slate-200 bg-white'}`}>
-              <div className="flex items-start justify-between gap-3">
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between sm:gap-3">
                 <div className="min-w-0 flex-1">
                   <div className="font-medium truncate flex items-center gap-2">
                     {p.status === 'pending' && (
@@ -564,10 +565,10 @@ export default function GmailReviewQueue({ onImported }) {
                     </div>
                   )}
                 </div>
-                <div className="flex gap-2 shrink-0">
+                <div className="flex flex-wrap gap-2 shrink-0">
                   {p.status === 'pending' && (
                     <button
-                      className="btn-ghost text-xs flex items-center gap-1"
+                      className="btn-ghost text-xs flex items-center gap-1 tap-target"
                       onClick={() => setPreviewId(p.id)}
                       disabled={busyId === p.id}
                       data-testid={`preview-btn-${p.id}`}
@@ -578,16 +579,16 @@ export default function GmailReviewQueue({ onImported }) {
                   )}
                   {p.status === 'pending' && (
                     <>
-                      <button className="btn-primary text-xs" onClick={() => importOne(p.id)} disabled={busyId === p.id}>
+                      <button className="btn-primary text-xs tap-target" onClick={() => importOne(p.id)} disabled={busyId === p.id}>
                         Import
                       </button>
-                      <button className="btn-ghost text-xs" onClick={() => dismiss(p.id)} disabled={busyId === p.id}>
+                      <button className="btn-ghost text-xs tap-target" onClick={() => dismiss(p.id)} disabled={busyId === p.id}>
                         Dismiss
                       </button>
                     </>
                   )}
                   {p.status === 'dismissed' && (
-                    <button className="btn-secondary text-xs" onClick={() => restore(p.id)} disabled={busyId === p.id} data-testid={`restore-btn-${p.id}`}>
+                    <button className="btn-secondary text-xs tap-target" onClick={() => restore(p.id)} disabled={busyId === p.id} data-testid={`restore-btn-${p.id}`}>
                       <RotateCcw size={11} /> Restore
                     </button>
                   )}

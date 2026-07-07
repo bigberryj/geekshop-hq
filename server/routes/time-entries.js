@@ -138,6 +138,43 @@ export async function timeRoutes(app) {
     return { id: info.lastInsertRowid, duration_seconds: duration, elapsed_seconds: duration, status: 'stopped' };
   });
 
+  // Update a manual entry's note / start / stop / duration. Active timers
+  // (stopped_at IS NULL) are intentionally not editable from here — the
+  // start/pause/resume/stop endpoints own the live timer state machine.
+  app.patch('/api/tickets/:id/time/:entryId', async (req, reply) => {
+    const { entryId } = req.params;
+    const row = app.db.prepare('SELECT * FROM time_entries WHERE id = ? AND ticket_id = ?').get(entryId, req.params.id);
+    if (!row) return reply.code(404).send({ error: 'not found' });
+    if (row.stopped_at == null) return reply.code(400).send({ error: 'active timers are not editable here' });
+
+    const { started_at, stopped_at, note } = req.body || {};
+    const nextStart = started_at ?? row.started_at;
+    const nextStop = stopped_at ?? row.stopped_at;
+    const nextDuration = Math.max(0, Math.round((new Date(nextStop) - new Date(nextStart)) / 1000));
+    const nextNote = note === undefined ? row.note : note;
+    app.db.prepare(`
+      UPDATE time_entries
+      SET started_at = ?, stopped_at = ?, duration_seconds = ?, note = ?
+      WHERE id = ?
+    `).run(nextStart, nextStop, nextDuration, nextNote, entryId);
+    return app.db.prepare(`
+      SELECT *, ${elapsedExpression()} AS elapsed_seconds
+      FROM time_entries WHERE id = ?
+    `).get(entryId);
+  });
+
+  // Delete a time entry. Allowed for stopped entries only — you should
+  // never silently drop a still-running timer. Returns 409 if the entry
+  // is still active; the UI should stop or pause first.
+  app.delete('/api/tickets/:id/time/:entryId', async (req, reply) => {
+    const { entryId } = req.params;
+    const row = app.db.prepare('SELECT id, stopped_at FROM time_entries WHERE id = ? AND ticket_id = ?').get(entryId, req.params.id);
+    if (!row) return reply.code(404).send({ error: 'not found' });
+    if (row.stopped_at == null) return reply.code(409).send({ error: 'cannot delete a running or paused timer; stop it first' });
+    app.db.prepare('DELETE FROM time_entries WHERE id = ?').run(entryId);
+    return { ok: true };
+  });
+
   // Time log view (all)
   app.get('/api/time', async (req) => {
     const { customer_id, since } = req.query;

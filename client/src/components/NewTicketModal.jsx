@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { fetchJson, postJson } from '../lib/api.js';
+import Modal from './Modal.jsx';
 
 /**
  * NewTicketModal
@@ -54,8 +55,6 @@ export default function NewTicketModal({ open, onClose }) {
     return () => clearTimeout(handle);
   }, [customerQuery, open, showNewCustomer]);
 
-  if (!open) return null;
-
   const createCustomer = async (e) => {
     e?.preventDefault?.();
     setError('');
@@ -97,97 +96,99 @@ export default function NewTicketModal({ open, onClose }) {
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60" onClick={onClose}>
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl p-6" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between mb-4">
-          <h3 className="text-lg font-semibold">New ticket</h3>
-          <button className="text-slate-500 hover:text-slate-900" onClick={onClose}>✕</button>
+    <Modal
+      open={open}
+      onClose={onClose}
+      title="New ticket"
+      footer={
+        <>
+          <button type="button" className="btn-secondary tap-target" onClick={onClose}>Cancel</button>
+          <button
+            className="btn-primary tap-target"
+            disabled={busy || !selectedCustomer || !subject.trim()}
+            onClick={submit}
+          >
+            {busy ? 'Creating…' : 'Create ticket'}
+          </button>
+        </>
+      }
+    >
+      <form className="space-y-4" onSubmit={submit}>
+        {/* Customer picker */}
+        <div>
+          <label className="label">Customer</label>
+          {selectedCustomer ? (
+            <div className="flex items-center justify-between border border-slate-200 rounded px-3 py-2 gap-2">
+              <div className="min-w-0 flex-1">
+                <div className="font-medium truncate">{selectedCustomer.name}</div>
+                <div className="text-xs text-slate-500 truncate">{selectedCustomer.email || selectedCustomer.company || 'no email on file'}</div>
+              </div>
+              <button type="button" className="text-xs text-brand-600 hover:underline tap-target shrink-0" onClick={() => setSelectedCustomer(null)}>Change</button>
+            </div>
+          ) : showNewCustomer ? (
+            <div className="border border-amber-200 bg-amber-50 rounded p-3 space-y-2">
+              <div className="text-xs text-amber-800">New customer (not found in system)</div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                <input className="input" placeholder="Name *" value={newCustomer.name} onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })} required />
+                <input className="input" placeholder="Email" value={newCustomer.email} onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })} />
+                <input className="input" placeholder="Company" value={newCustomer.company} onChange={(e) => setNewCustomer({ ...newCustomer, company: e.target.value })} />
+                <input className="input" placeholder="Phone" value={newCustomer.phone} onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })} />
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <button type="button" className="btn-secondary text-sm tap-target" onClick={createCustomer} disabled={busy}>Create customer</button>
+                <button type="button" className="btn-ghost text-sm tap-target" onClick={() => setShowNewCustomer(false)}>Cancel</button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <input
+                className="input"
+                placeholder="Search customer by name, email, or company..."
+                value={customerQuery}
+                onChange={(e) => setCustomerQuery(e.target.value)}
+              />
+              <div className="border border-slate-200 rounded mt-1 max-h-40 overflow-y-auto modal-scroll">
+                {customerResults.length === 0 ? (
+                  <div className="px-3 py-2 text-sm text-slate-500">No matches.</div>
+                ) : customerResults.map((c) => (
+                  <button
+                    type="button"
+                    key={c.id}
+                    className="block w-full text-left px-3 py-2 hover:bg-slate-50 text-sm border-b border-slate-100 last:border-0"
+                    onClick={() => setSelectedCustomer(c)}
+                  >
+                    <div className="font-medium truncate">{c.name}</div>
+                    <div className="text-xs text-slate-500 truncate">{c.email || ''}{c.company ? ` · ${c.company}` : ''}</div>
+                  </button>
+                ))}
+              </div>
+              <button type="button" className="text-xs text-brand-600 hover:underline mt-1 tap-target" onClick={() => setShowNewCustomer(true)}>
+                + Create new customer
+              </button>
+            </div>
+          )}
         </div>
 
-        <form className="space-y-4" onSubmit={submit}>
-          {/* Customer picker */}
-          <div>
-            <label className="label">Customer</label>
-            {selectedCustomer ? (
-              <div className="flex items-center justify-between border border-slate-200 rounded px-3 py-2">
-                <div>
-                  <div className="font-medium">{selectedCustomer.name}</div>
-                  <div className="text-xs text-slate-500">{selectedCustomer.email || selectedCustomer.company || 'no email on file'}</div>
-                </div>
-                <button type="button" className="text-xs text-brand-600 hover:underline" onClick={() => setSelectedCustomer(null)}>Change</button>
-              </div>
-            ) : showNewCustomer ? (
-              <div className="border border-amber-200 bg-amber-50 rounded p-3 space-y-2">
-                <div className="text-xs text-amber-800">New customer (not found in system)</div>
-                <div className="grid grid-cols-2 gap-2">
-                  <input className="input" placeholder="Name *" value={newCustomer.name} onChange={(e) => setNewCustomer({ ...newCustomer, name: e.target.value })} required />
-                  <input className="input" placeholder="Email" value={newCustomer.email} onChange={(e) => setNewCustomer({ ...newCustomer, email: e.target.value })} />
-                  <input className="input" placeholder="Company" value={newCustomer.company} onChange={(e) => setNewCustomer({ ...newCustomer, company: e.target.value })} />
-                  <input className="input" placeholder="Phone" value={newCustomer.phone} onChange={(e) => setNewCustomer({ ...newCustomer, phone: e.target.value })} />
-                </div>
-                <div className="flex gap-2">
-                  <button type="button" className="btn-secondary text-sm" onClick={createCustomer} disabled={busy}>Create customer</button>
-                  <button type="button" className="btn-ghost text-sm" onClick={() => setShowNewCustomer(false)}>Cancel</button>
-                </div>
-              </div>
-            ) : (
-              <div>
-                <input
-                  className="input"
-                  placeholder="Search customer by name, email, or company..."
-                  value={customerQuery}
-                  onChange={(e) => setCustomerQuery(e.target.value)}
-                />
-                <div className="border border-slate-200 rounded mt-1 max-h-40 overflow-y-auto">
-                  {customerResults.length === 0 ? (
-                    <div className="px-3 py-2 text-sm text-slate-500">No matches.</div>
-                  ) : customerResults.map((c) => (
-                    <button
-                      type="button"
-                      key={c.id}
-                      className="block w-full text-left px-3 py-2 hover:bg-slate-50 text-sm border-b border-slate-100 last:border-0"
-                      onClick={() => setSelectedCustomer(c)}
-                    >
-                      <div className="font-medium">{c.name}</div>
-                      <div className="text-xs text-slate-500">{c.email || ''}{c.company ? ` · ${c.company}` : ''}</div>
-                    </button>
-                  ))}
-                </div>
-                <button type="button" className="text-xs text-brand-600 hover:underline mt-1" onClick={() => setShowNewCustomer(true)}>
-                  + Create new customer
-                </button>
-              </div>
-            )}
-          </div>
+        <div>
+          <label className="label">Subject</label>
+          <input className="input" value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="Short description" required />
+        </div>
+        <div>
+          <label className="label">Details (optional)</label>
+          <textarea className="input min-h-[100px]" value={body} onChange={(e) => setBody(e.target.value)} placeholder="Context, what the customer said, etc." />
+        </div>
+        <div>
+          <label className="label">Priority</label>
+          <select className="input w-full sm:w-40" value={priority} onChange={(e) => setPriority(e.target.value)}>
+            <option value="low">Low</option>
+            <option value="normal">Normal</option>
+            <option value="high">High</option>
+            <option value="urgent">Urgent</option>
+          </select>
+        </div>
 
-          <div>
-            <label className="label">Subject</label>
-            <input className="input" value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="Short description" required />
-          </div>
-          <div>
-            <label className="label">Details (optional)</label>
-            <textarea className="input min-h-[100px]" value={body} onChange={(e) => setBody(e.target.value)} placeholder="Context, what the customer said, etc." />
-          </div>
-          <div>
-            <label className="label">Priority</label>
-            <select className="input w-40" value={priority} onChange={(e) => setPriority(e.target.value)}>
-              <option value="low">Low</option>
-              <option value="normal">Normal</option>
-              <option value="high">High</option>
-              <option value="urgent">Urgent</option>
-            </select>
-          </div>
-
-          {error && <div className="rounded bg-red-50 border border-red-200 text-red-700 text-sm p-2">{error}</div>}
-
-          <div className="flex justify-end gap-2 pt-2">
-            <button type="button" className="btn-secondary" onClick={onClose}>Cancel</button>
-            <button className="btn-primary" disabled={busy || !selectedCustomer || !subject.trim()}>
-              {busy ? 'Creating…' : 'Create ticket'}
-            </button>
-          </div>
-        </form>
-      </div>
-    </div>
+        {error && <div className="rounded bg-red-50 border border-red-200 text-red-700 text-sm p-2">{error}</div>}
+      </form>
+    </Modal>
   );
 }

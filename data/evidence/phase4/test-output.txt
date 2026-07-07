@@ -1,0 +1,8 @@
+RUN  v2.1.9 /home/byron/projects/geekshop-hq/server
+
+ ✓ test/phase4-expenses.test.js (26 tests) 486ms
+
+ Test Files  1 passed (1)
+      Tests  26 passed (26)
+   Start at  11:12:44
+   Duration  1.58s (transform 261ms, setup 0ms, collect 762ms, tests 486ms, environment 0ms, prepare 87ms)

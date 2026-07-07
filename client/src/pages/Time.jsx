@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { fetchJson, formatDuration } from '../lib/api.js';
+import PageHeader from '../components/PageHeader.jsx';
+import DataTable from '../components/DataTable.jsx';
 
 export default function Time() {
   const [entries, setEntries] = useState([]);
@@ -13,11 +15,36 @@ export default function Time() {
     return acc;
   }, {});
 
+  const columns = [
+    {
+      key: 'started_at',
+      header: 'When',
+      primary: true,
+      render: (e) => <span className="text-xs">{new Date(e.started_at).toLocaleString()}</span>,
+    },
+    {
+      key: 'subject',
+      header: 'Ticket',
+      hideOnMobile: true,
+      render: (e) => (
+        <Link to={`/tickets/${e.ticket_id}`} className="text-brand-600 hover:underline break-words" title={`Internal: ${e.ticket_uid}`}>
+          {e.subject || e.ticket_uid}
+        </Link>
+      ),
+    },
+    { key: 'customer_name', header: 'Customer', hideOnMobile: true },
+    { key: 'duration_seconds', header: 'Duration', render: (e) => <span className="font-mono">{formatDuration(e.duration_seconds)}</span>, align: 'right' },
+    { key: 'note', header: 'Note', hideOnMobile: true, render: (e) => <span className="text-slate-600 text-xs">{e.note || '—'}</span> },
+  ];
+
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-6">Time log</h2>
+      <PageHeader title="Time log" />
+
       <div className="card mb-4">
-        <div className="text-sm text-slate-500">Total tracked (last 30 days): <span className="font-semibold text-slate-900">{formatDuration(total)}</span></div>
+        <div className="text-sm text-slate-500">
+          Total tracked (last 30 days): <span className="font-semibold text-slate-900">{formatDuration(total)}</span>
+        </div>
         <div className="text-xs text-slate-500 mt-2">By customer:</div>
         <ul className="mt-1">
           {Object.entries(byCustomer).map(([name, secs]) => (
@@ -27,25 +54,13 @@ export default function Time() {
           ))}
         </ul>
       </div>
-      <div className="card overflow-hidden p-0">
-        <table className="w-full text-sm">
-          <thead className="bg-slate-50 text-left">
-            <tr><th className="px-3 py-2">When</th><th className="px-3 py-2">Ticket</th><th className="px-3 py-2">Customer</th><th className="px-3 py-2">Duration</th><th className="px-3 py-2">Note</th></tr>
-          </thead>
-          <tbody>
-            {entries.map((e) => (
-              <tr key={e.id} className="border-t">
-                <td className="px-3 py-2 text-xs">{new Date(e.started_at).toLocaleString()}</td>
-                <td className="px-3 py-2"><Link to={`/tickets/${e.ticket_id}`} className="text-brand-600 hover:underline" title={`Internal: ${e.ticket_uid}`}>{e.subject || e.ticket_uid}</Link></td>
-                <td className="px-3 py-2">{e.customer_name}</td>
-                <td className="px-3 py-2 font-mono">{formatDuration(e.duration_seconds)}</td>
-                <td className="px-3 py-2 text-slate-600 text-xs">{e.note || '—'}</td>
-              </tr>
-            ))}
-            {entries.length === 0 && <tr><td colSpan="5" className="px-3 py-4 text-center text-slate-500">No time tracked</td></tr>}
-          </tbody>
-        </table>
-      </div>
+
+      <DataTable
+        columns={columns}
+        rows={entries}
+        rowKey="id"
+        empty="No time tracked yet."
+      />
     </div>
   );
 }

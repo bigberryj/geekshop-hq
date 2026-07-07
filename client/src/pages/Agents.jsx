@@ -61,15 +61,15 @@ export default function Agents() {
   const worker = roster?.worker_cron || {};
 
   return (
-    <div className="p-6 space-y-6">
-      <header className="flex items-center justify-between">
-        <div>
+    <div className="p-4 md:p-6 space-y-6">
+      <header className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold">Agents</h1>
           <p className="text-sm text-slate-500 mt-1">
             Hermes roster. Addressable gateways can be messaged directly. Specialist profiles are configurations Johnny5 uses on demand.
           </p>
         </div>
-        <button onClick={load} className="btn-secondary text-sm flex items-center gap-1">
+        <button onClick={load} className="btn-secondary text-sm flex items-center gap-1 tap-target self-start md:self-auto">
           <RefreshCw className="w-4 h-4" /> Refresh
         </button>
       </header>

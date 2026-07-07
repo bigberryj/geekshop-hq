@@ -10,3 +10,5 @@ build/
 .vitest/
 coverage/
 .DS_Store
+
+data/backups/

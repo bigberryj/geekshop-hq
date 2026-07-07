@@ -4,6 +4,30 @@
 
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
 
+/* Responsive pass (mobile-friendly).
+ * - Allow very long unbroken strings (emails, ticket subjects, IDs) to wrap
+ *   instead of pushing the page wider than the viewport and triggering
+ *   horizontal scroll on phones.
+ * - Constrain horizontal overflow at the root so a single oversized table
+ *   can't make the whole document horizontally scroll. Pages that need their
+ *   own horizontal scroll wrap that section in a .table-scroll container. */
+html, body, #root { min-height: 100%; }
+body { overflow-x: hidden; }
+.break-words { word-break: break-word; overflow-wrap: anywhere; }
+
+/* Tap target floor — Apple HIG suggests 44px, Material 48dp. Buttons inside
+ * data tables and the nav drawer honour it. Existing `.btn` is unchanged so
+ * everything continues to look identical on desktop. */
+.tap-target { min-height: 44px; }
+
+/* Horizontally scrollable data region (used by component code that wants a
+ * wide table on small screens rather than a card collapse). */
+.table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+
+/* When the bottom-sheet modal is open, give iOS Safari room to scroll
+ * inside the sheet without bouncing the page background. */
+.modal-scroll { -webkit-overflow-scrolling: touch; overscroll-behavior: contain; }
+
 .card { @apply bg-white rounded-lg shadow-sm border border-slate-200 p-4; }
 .btn { @apply inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-sm font-medium transition; }
 .btn-primary { @apply btn bg-brand-600 text-white hover:bg-brand-700; }

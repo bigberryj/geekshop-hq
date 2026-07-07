@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react';
 import { fetchJson, putJson, postJson } from '../lib/api.js';
+import PageHeader from '../components/PageHeader.jsx';
+import SignatureWysiwyg from '../components/SignatureWysiwyg.jsx';
 
 const TAX_MODELS = [
   { key: 'none', label: 'No tax' },
@@ -53,7 +55,7 @@ export default function Settings() {
 
   return (
     <div>
-      <h2 className="text-2xl font-bold mb-6">Settings</h2>
+      <PageHeader title="Settings" />
 
       <section className="card mb-4">
         <h3 className="font-semibold mb-3">Business</h3>
@@ -68,7 +70,7 @@ export default function Settings() {
         <p className="text-xs text-slate-500 mb-3">Default tax model applies to every new invoice. You can override per-invoice at creation time.</p>
         <div className="mb-2">
           <label className="label">Default tax model</label>
-          <select className="input w-80" value={settings.default_tax_model || 'gst_pst_bc'} onChange={(e) => update('default_tax_model', e.target.value)}>
+          <select className="input w-full sm:w-80" value={settings.default_tax_model || 'gst_pst_bc'} onChange={(e) => update('default_tax_model', e.target.value)}>
             {TAX_MODELS.map((m) => (
               <option key={m.key} value={m.key}>{m.label}</option>
             ))}
@@ -150,18 +152,23 @@ export default function Settings() {
         <h3 className="font-semibold mb-3">Outbound email signature</h3>
         <p className="text-xs text-slate-500 mb-3">
           Appended to every ticket reply sent to a customer ("Email customer" and "Reply &amp; resolve").
-          Plain text only — newlines preserved. Leave empty to disable.
+          Choose <b>Plain</b> for a simple text signature or <b>Rich</b> for the WYSIWYG editor
+          (bold, links, images, basic tables). Leave empty to disable.
         </p>
-        <SignatureField
-          value={settings.email_signature || ''}
-          onSave={(v) => update('email_signature', v)}
+        <SignatureEditor
+          plainValue={settings.email_signature || ''}
+          htmlValue={settings.email_signature_html || ''}
+          format={settings.email_signature_format || 'plain'}
+          onSavePlain={(v) => update('email_signature', v)}
+          onSaveHtml={(v) => update('email_signature_html', v)}
+          onSaveFormat={(v) => update('email_signature_format', v)}
         />
       </section>
 
       <section className="card mb-4">
         <h3 className="font-semibold mb-3">AI provider (two-tier)</h3>
         <p className="text-xs text-slate-500 mb-3">High-reasoning tasks (reply drafts, summary, extraction) use the provider below. Cheap/fast tasks (classification, nudges) use the other.</p>
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
             <label className="label">High-reasoning</label>
             <div className="flex gap-2">
@@ -237,34 +244,119 @@ function ListField({ label, hint, value, onSave }) {
   );
 }
 
-function SignatureField({ value, onSave }) {
-  const [v, setV] = useState(value || '');
-  useEffect(() => { setV(value || ''); }, [value]);
-  const commit = () => onSave(v);
+function SignatureEditor({ plainValue, htmlValue, format, onSavePlain, onSaveHtml, onSaveFormat }) {
+  const [mode, setMode] = useState(format === 'html' ? 'html' : 'plain');
+  const [plain, setPlain] = useState(plainValue || '');
+  const [html, setHtml] = useState(htmlValue || '');
+  useEffect(() => { setPlain(plainValue || ''); }, [plainValue]);
+  useEffect(() => { setHtml(htmlValue || ''); }, [htmlValue]);
+  useEffect(() => { setMode(format === 'html' ? 'html' : 'plain'); }, [format]);
+
+  const switchMode = (next) => {
+    if (next === mode) return;
+    setMode(next);
+    onSaveFormat(next);
+  };
+
+  // Sanitize a small allowlist in the preview so the live preview is
+  // safe to render with dangerouslySetInnerHTML. The server applies the
+  // same allowlist before sending. Mirrors server/lib/signature.js
+  // sanitizeRichSignature — keep them in sync.
+  const sanitizePreview = (raw) => {
+    if (!raw) return '';
+    // Drop script/style/iframe/object/embed/form/link/meta/base entirely
+    let s = String(raw)
+      .replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, '')
+      .replace(/<style\b[^>]*>[\s\S]*?<\/style\s*>/gi, '')
+      .replace(/<(iframe|object|embed|link|meta|base|form)\b[^>]*>[\s\S]*?<\/\1\s*>/gi, '')
+      .replace(/<(iframe|object|embed|link|meta|base|form)\b[^>]*\/?>/gi, '');
+    // Strip on* event handlers
+    s = s.replace(/\s+on[a-z]+\s*=\s*"[^"]*"/gi, '');
+    s = s.replace(/\s+on[a-z]+\s*=\s*'[^']*'/gi, '');
+    s = s.replace(/\s+on[a-z]+\s*=\s*[^\s>]+/gi, '');
+    // Strip javascript: / data: / vbscript: in href/src
+    s = s.replace(/(\s(?:href|src)\s*=\s*")\s*(?:javascript|data|vbscript|file):[^"]*"/gi, '$1#"');
+    s = s.replace(/(\s(?:href|src)\s*=\s*')\s*(?:javascript|data|vbscript|file):[^']*'/gi, "$1#'");
+    s = s.replace(/(\s(?:href|src)\s*=\s*)(?:javascript|data|vbscript|file):[^\s>]+/gi, '$1#');
+    return s;
+  };
+
   const sample = `Hi Linda — coming out tomorrow to assess the firewall. I have a 10am-11:30am slot open if that works.`;
-  const preview = v.trim() ? `${sample}\n\n--\n${v}` : sample;
+
   return (
     <div className="max-w-2xl">
-      <label className="label">Signature (plain text)</label>
-      <textarea
-        className="input font-mono text-xs"
-        rows={5}
-        value={v}
-        onChange={(e) => setV(e.target.value)}
-        onBlur={commit}
-        placeholder={'Byron Berry\nGeekShop Computers\nbyron@geekshop.ca · 250-555-0100'}
-      />
-      <div className="flex gap-2 mt-2">
-        <button className="btn-secondary" onClick={commit}>Save</button>
-        <span className="self-center text-xs text-slate-500">Saves on blur or button click.</span>
+      <div className="mb-2 flex items-center gap-2">
+        <label className="label !mb-0">Format:</label>
+        <div className="inline-flex rounded border border-slate-300 overflow-hidden text-xs">
+          <button
+            type="button"
+            className={`px-3 py-1 ${mode === 'plain' ? 'bg-brand-600 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'}`}
+            onClick={() => switchMode('plain')}
+            data-testid="sig-mode-plain"
+          >Plain text</button>
+          <button
+            type="button"
+            className={`px-3 py-1 ${mode === 'html' ? 'bg-brand-600 text-white' : 'bg-white text-slate-700 hover:bg-slate-50'}`}
+            onClick={() => switchMode('html')}
+            data-testid="sig-mode-html"
+          >Rich (HTML)</button>
+        </div>
+        <span className="text-xs text-slate-500">Changes save on switch.</span>
       </div>
-      <div className="mt-3">
-        <div className="text-xs text-slate-500 mb-1">Live preview (sample reply + your signature):</div>
-        <pre
-          className="text-xs bg-slate-50 border border-slate-200 rounded p-3 whitespace-pre-wrap font-mono"
-          data-testid="signature-preview"
-        >{preview}</pre>
-      </div>
+
+      {mode === 'plain' ? (
+        <div>
+          <label className="label">Signature (plain text)</label>
+          <textarea
+            className="input font-mono text-xs"
+            rows={5}
+            value={plain}
+            onChange={(e) => setPlain(e.target.value)}
+            onBlur={() => onSavePlain(plain)}
+            placeholder={'Byron Berry\nGeekShop Computers\nbyron@geekshop.ca · 250-555-0100'}
+            data-testid="sig-plain-input"
+          />
+          <div className="flex gap-2 mt-2">
+            <button className="btn-secondary" onClick={() => onSavePlain(plain)}>Save</button>
+            <span className="self-center text-xs text-slate-500">Saves on blur or button click.</span>
+          </div>
+          <div className="mt-3">
+            <div className="text-xs text-slate-500 mb-1">Live preview (sample reply + your signature):</div>
+            <pre
+              className="text-xs bg-slate-50 border border-slate-200 rounded p-3 whitespace-pre-wrap font-mono"
+              data-testid="signature-preview"
+            >{plain.trim() ? `${sample}\n\n--\n${plain}` : sample}</pre>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <label className="label">Signature (rich)</label>
+          <p className="text-xs text-slate-500 mb-2">
+            Use the toolbar to format your signature (bold, italic, lists, links, images).
+            Allowed tags: a, b, strong, i, em, u, span, div, p, br, img, h1–h6, ul, ol, li, table, tr, th, td.
+            <br />
+            <code>href</code>/<code>src</code> must use <code>http(s)</code> or <code>mailto</code>. Anything else is stripped on save.
+            Press <kbd className="px-1 py-0.5 bg-white border border-slate-300 rounded text-[10px]">Ctrl/Cmd-S</kbd> to save.
+          </p>
+          <SignatureWysiwyg
+            value={html}
+            onSave={(v) => { setHtml(v); onSaveHtml(v); }}
+            onCancel={() => setHtml(htmlValue || '')}
+          />
+          <div className="mt-3">
+            <div className="text-xs text-slate-500 mb-1">Email preview (rendered HTML — what customers will see):</div>
+            <div
+              className="text-sm bg-slate-50 border border-slate-200 rounded p-3"
+              dangerouslySetInnerHTML={{
+                __html: html.trim()
+                  ? `${sample}<div style="margin-top:1em;padding-top:0.75em;border-top:1px solid #e5e7eb;color:#475569;font-size:0.9em">${sanitizePreview(html)}</div>`
+                  : `<span class="text-slate-400">${sample}</span>`,
+              }}
+              data-testid="signature-preview"
+            />
+          </div>
+        </div>
+      )}
     </div>
   );
 }

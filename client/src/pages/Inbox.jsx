@@ -4,6 +4,7 @@ import { fetchJson, formatMoney } from '../lib/api.js';
 import TicketLabel from '../components/TicketLabel.jsx';
 import GmailReviewQueue from '../components/GmailReviewQueue.jsx';
 import NewTicketModal from '../components/NewTicketModal.jsx';
+import PageHeader from '../components/PageHeader.jsx';
 import { AlertCircle, Clock, DollarSign, Mail, CalendarClock, Activity, Plus } from 'lucide-react';
 
 const SOURCES = [
@@ -41,14 +42,16 @@ export default function Inbox() {
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-6 gap-2">
-        <h2 className="text-2xl font-bold">Inbox</h2>
-        <button className="btn-primary flex items-center gap-1" onClick={() => setShowNew(true)}>
-          <Plus size={14} /> New ticket
-        </button>
-      </div>
+      <PageHeader
+        title="Inbox"
+        actions={
+          <button className="btn-primary flex items-center gap-1 tap-target" onClick={() => setShowNew(true)}>
+            <Plus size={14} /> New ticket
+          </button>
+        }
+      />
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+      <div className="grid grid-cols-2 md:grid-cols-2 gap-3 md:gap-4">
         <GmailReviewQueue onImported={onImported} />
 
         <Stat icon={AlertCircle} label="Open requests" value={data.open_tickets.length} color="text-blue-600" />

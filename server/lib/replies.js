@@ -77,7 +77,11 @@ export async function matchReplyToTicket(db, msg) {
 
   // Strategy 1: thread match by source_message_id of any open ticket.
   // We accept any of the message's In-Reply-To / References headers
-  // as a match against tickets.source_message_id.
+  // as a match against tickets.source_message_id. Soft-deleted tickets
+  // are excluded — a deleted thread shouldn't auto-reopen on the next
+  // customer reply. (The customer can still send a new message that
+  // will land in the pending queue, where the operator can restore
+  // the original ticket or open a fresh one.)
   const threadRefs = await collectThreadReferences(msg);
   if (threadRefs.length) {
     const placeholders = threadRefs.map(() => '?').join(',');
@@ -85,6 +89,7 @@ export async function matchReplyToTicket(db, msg) {
       SELECT id, customer_id, subject FROM tickets
       WHERE source_message_id IN (${placeholders})
         AND status != 'resolved'
+        AND deleted_at IS NULL
       ORDER BY last_message_at DESC LIMIT 1
     `).get(...threadRefs);
     if (ticket) {
@@ -98,14 +103,15 @@ export async function matchReplyToTicket(db, msg) {
   // new subject (with Re:/Fwd: stripped) to contain the ticket's
   // stripped subject. Both directions checked to handle both
   // "Re: Volunteer Cowichan" matching "Volunteer Cowichan" and
-  // truncated subjects on the ticket side.
+  // truncated subjects on the ticket side. Soft-deleted tickets are
+  // skipped for the same reason as Strategy 1.
   const stripped = stripReFwd(msg.subject);
   if (!stripped) return null;
   const customer = db.prepare('SELECT id FROM customers WHERE LOWER(email) = ?').get(fromEmail);
   if (!customer) return null;
   const candidates = db.prepare(`
     SELECT id, subject FROM tickets
-    WHERE customer_id = ? AND status != 'resolved'
+    WHERE customer_id = ? AND status != 'resolved' AND deleted_at IS NULL
     ORDER BY last_message_at DESC LIMIT 25
   `).all(customer.id);
 

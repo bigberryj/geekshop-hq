@@ -79,7 +79,7 @@ describe('db/migrate.js', () => {
   it('creates all expected tables', () => {
     const tables = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").all().map((t) => t.name).filter((n) => !n.startsWith('_') && n !== 'sqlite_sequence');
     expect(tables.sort()).toEqual([
-      'agent_tasks', 'appointments', 'audit_log', 'customer_memory', 'customers', 'invoices', 'pending_email_attachments', 'pending_emails', 'recurring_patterns', 'sessions', 'settings', 'style_feedback', 'style_samples', 'ticket_message_attachments', 'ticket_messages', 'tickets', 'time_entries',
+      'agent_tasks', 'appointments', 'audit_log', 'client_assets', 'client_contacts', 'client_invites', 'client_portal_audit', 'client_portal_credentials', 'client_portal_sessions', 'contract_clients', 'contract_locations', 'contract_request_events', 'contract_requests', 'customer_memory', 'customers', 'expense_categories', 'expenses', 'invoices', 'payment_events', 'payments', 'pending_email_attachments', 'pending_emails', 'products', 'recurring_patterns', 'sessions', 'settings', 'style_feedback', 'style_samples', 'tax_rates', 'ticket_message_attachments', 'ticket_messages', 'tickets', 'time_entries',
     ]);
   });
 

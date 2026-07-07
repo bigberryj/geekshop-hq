@@ -1,0 +1,42 @@
+-- 034 — Phase 3 (billing/accounting roadmap): Payments ledger + invoice state upgrades.
+--
+-- The `payments` table was created in migration 031 and is the canonical
+-- ledger of money received against invoices. This migration documents the
+-- new invoice state machine that Phase 3 wires up.
+--
+-- No new columns are required: `invoices.status` is plain TEXT (001) and
+-- accepts the additional value `partial` without an ALTER. The route layer
+-- (server/routes/accounting.js, server/routes/invoices.js) decides which
+-- transitions are legal.
+--
+-- Updated state machine (allowed at the API; documented in docs/schema.md):
+--
+--   draft ──send──▶ sent ──auto──▶ viewed
+--                          ╲
+--                           ──auto(success payment)──▶ partial ──auto(fully paid)──▶ paid
+--                                                                            ╲
+--                                                                             ──manual──▶ paid
+--                          ╲
+--                           ──auto(due_at < now AND status IN sent/viewed/partial)──▶ overdue
+--                          ╲
+--                           ──manual──▶ cancelled (or void, same code path)
+--
+-- Notes:
+--
+--   * `partial` means: at least one `succeeded` payment exists, but
+--     SUM(amount_cents) < invoice.total_cents. Computed live from
+--     `payments` (see /api/accounting/payments/summary and the
+--     computed-status logic in server/routes/accounting.js).
+--
+--   * `cancelled` and `void` map to the same code in routes/invoices.js:
+--     status set, paid_at left alone. We treat `void` as a future alias
+--     that the migration leaves space for without a column change.
+--
+--   * Overdue is computed live by the leakage widget and the dashboard
+--     from `due_at < now AND status IN ('sent','viewed','partial')`. To
+--     keep reports fast and consistent, we add an index on `due_at` for
+--     sent/partially-paid invoices.
+
+CREATE INDEX IF NOT EXISTS idx_invoices_due_at_partial
+  ON invoices(due_at)
+  WHERE status IN ('sent', 'viewed', 'partial');

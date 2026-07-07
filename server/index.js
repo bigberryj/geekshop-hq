@@ -15,6 +15,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import Fastify from 'fastify';
 import cors from '@fastify/cors';
 import helmet from '@fastify/helmet';
+import multipart from '@fastify/multipart';
+import cookie from '@fastify/cookie';
 import { runMigrations } from './db/migrate.js';
 import { registerRoutes } from './routes/index.js';
 import { startScheduler, stopScheduler } from './lib/scheduler.js';
@@ -59,9 +61,46 @@ export async function buildServer(opts = {}) {
     origin: process.env.APP_URL ? [process.env.APP_URL, 'http://localhost:5173'] : true,
     credentials: true,
   });
+  // Multipart for receipt / attachment uploads.
+  // 26 MB multipart cap so the route layer (ATTACHMENT_MAX_BYTES = 25 MB
+  // in lib/attachments.js) is the authoritative size gate and can return
+  // a structured JSON 413. The 1 MB buffer lets us accept one legitimate
+  // request that just barely exceeds the business cap without Fastify
+  // short-circuiting at the plugin level with a bare 413 + 'Payload Too Large'.
+  await app.register(multipart, {
+    limits: { fileSize: 26 * 1024 * 1024, files: 1 },
+  });
+
+  // Cookie support — used by /api/auth/* (admin hq_sid) and the new
+  // /api/portal/* (client hq_csid) for the contract-clients module.
+  await app.register(cookie, { secret: process.env.COOKIE_SECRET || 'dev-cookie-secret-change-me' });
+
+  // Stripe webhook needs the raw bytes for signature verification.
+  // This content-type parser mirrors Fastify's default JSON parser but
+  // also stashes the original Buffer on req.rawBody before parsing.
+  // (Stripe's signature is over the exact bytes — JSON.stringify(req.body)
+  // would not produce the same bytes because key order can change.)
+  app.addContentTypeParser(
+    'application/json',
+    { parseAs: 'buffer' },
+    (req, body, done) => {
+      req.rawBody = body; // Buffer of the exact bytes received
+      if (!body || body.length === 0) {
+        return done(null, {});
+      }
+      try {
+        const json = JSON.parse(body.toString('utf8'));
+        return done(null, json);
+      } catch (err) {
+        err.statusCode = 400;
+        return done(err, undefined);
+      }
+    },
+  );
 
   const db = await runMigrations(dbPath);
   app.decorate('db', db);
+  app.decorate('dbPath', dbPath);
 
   // Wire the agent-tasks lib to broadcast activity through the SSE
   // channel (or no-op if no listeners are attached). Also keep a small

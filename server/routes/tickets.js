@@ -8,6 +8,7 @@ import { sendEmail } from '../lib/email.js';
 import { markThreadDone } from '../lib/email-inbox.js';
 import { readAttachmentBuffer } from '../lib/attachments.js';
 import { appendSignature } from '../lib/signature.js';
+import { logAudit } from '../lib/audit.js';
 
 function nextTicketUid(db) {
   const last = db.prepare("SELECT ticket_uid FROM tickets ORDER BY id DESC LIMIT 1").get();
@@ -19,14 +20,19 @@ export async function ticketRoutes(app) {
   // List
   // `status` can be a single value ("open") or a comma list
   // ("open,pending"). Empty/missing means "all statuses".
+  // Soft-deleted rows (deleted_at IS NOT NULL) are excluded by default;
+  // pass `?include_deleted=true` to surface them for review/restore.
   app.get('/api/tickets', async (req) => {
-    const { status, customer_id } = req.query;
+    const { status, customer_id, include_deleted } = req.query;
     let sql = `
       SELECT t.*, c.name as customer_name
       FROM tickets t JOIN customers c ON t.customer_id = c.id
       WHERE 1=1
     `;
     const args = [];
+    if (!include_deleted || String(include_deleted).toLowerCase() !== 'true') {
+      sql += ' AND t.deleted_at IS NULL';
+    }
     if (status) {
       const parts = String(status).split(',').map((s) => s.trim()).filter(Boolean);
       if (parts.length === 1) {
@@ -56,11 +62,13 @@ export async function ticketRoutes(app) {
         INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, 'customer', ?)
       `).run(info.lastInsertRowid, body);
     }
-    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.create', ?)").run(String(info.lastInsertRowid));
+    logAudit(app.db, 'ticket.create', info.lastInsertRowid);
     return { id: info.lastInsertRowid, ticket_uid: uid };
   });
 
   // Detail
+  // Soft-deleted tickets are still readable by id — the restore button
+  // needs the full payload (messages, customer memory) to round-trip.
   app.get('/api/tickets/:id', async (req, reply) => {
     const t = app.db.prepare(`
       SELECT t.*, c.name as customer_name, c.email as customer_email, c.id as customer_id
@@ -87,6 +95,65 @@ export async function ticketRoutes(app) {
       ORDER BY category, created_at
     `).all(t.customer_id);
     return { ...t, messages, customer_memory: memory };
+  });
+
+  // Soft-delete a ticket. The row stays in the DB (with `deleted_at`
+  // stamped) so audit history, invoice line_items referencing the
+  // ticket, and customer timeline remain intact. Any active timer on
+  // the ticket is auto-stopped so leakage reports don't keep counting
+  // a phantom running entry. The deleted row is hidden from the
+  // default list view and from the dashboard's "open tickets" tally.
+  app.delete('/api/tickets/:id', async (req, reply) => {
+    const t = app.db.prepare('SELECT id, status, deleted_at FROM tickets WHERE id = ?').get(req.params.id);
+    if (!t) return reply.code(404).send({ error: 'not found' });
+    if (t.deleted_at) return { ok: true, already_deleted: true };
+
+    const tx = app.db.transaction(() => {
+      // Finalize any active timer so the leakage / time-log pages
+      // don't keep reporting a running entry for a deleted ticket.
+      app.db.prepare(`
+        UPDATE time_entries
+        SET stopped_at = COALESCE(stopped_at, CURRENT_TIMESTAMP),
+            paused_at  = NULL,
+            duration_seconds = CASE
+              WHEN stopped_at IS NOT NULL THEN COALESCE(duration_seconds, 0)
+              WHEN paused_at  IS NOT NULL THEN COALESCE(duration_seconds, 0)
+              ELSE CAST(COALESCE(duration_seconds, 0) +
+                       ((julianday(CURRENT_TIMESTAMP) - julianday(started_at)) * 86400) AS INTEGER)
+            END
+        WHERE ticket_id = ? AND stopped_at IS NULL
+      `).run(req.params.id);
+
+      app.db.prepare(`
+        UPDATE tickets
+        SET deleted_at = CURRENT_TIMESTAMP,
+            deleted_by = 'admin',
+            status     = CASE WHEN status = 'open' THEN 'resolved' ELSE status END,
+            resolved_at = CASE WHEN status = 'open' THEN CURRENT_TIMESTAMP ELSE resolved_at END
+        WHERE id = ?
+      `).run(req.params.id);
+    });
+    tx();
+
+    logAudit(app.db, 'ticket.delete', req.params.id, {
+      prior_status: t.status,
+    });
+    return { ok: true };
+  });
+
+  // Restore a soft-deleted ticket. Clears `deleted_at` and brings the
+  // ticket back into the default list view. Status is left as it was
+  // at delete time (a previously-resolved ticket stays resolved); the
+  // operator can re-open from the detail page if they want to.
+  app.post('/api/tickets/:id/restore', async (req, reply) => {
+    const t = app.db.prepare('SELECT id, status, deleted_at FROM tickets WHERE id = ?').get(req.params.id);
+    if (!t) return reply.code(404).send({ error: 'not found' });
+    if (!t.deleted_at) return { ok: true, already_live: true };
+    app.db.prepare(`
+      UPDATE tickets SET deleted_at = NULL, deleted_by = NULL WHERE id = ?
+    `).run(req.params.id);
+    logAudit(app.db, 'ticket.restore', req.params.id, {});
+    return { ok: true };
   });
 
   // Reply
@@ -259,12 +326,16 @@ Reply with just the draft text, no preamble.`;
     `).get(req.params.id);
     if (!t) return reply.code(404).send({ error: 'not found' });
     app.db.prepare("UPDATE tickets SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP WHERE id = ?").run(req.params.id);
-    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.resolve', ?)").run(req.params.id);
+    logAudit(app.db, 'ticket.resolve', req.params.id);
 
     // Try to send resolution email (no ticket UID, no "ticket" wording — customer-facing)
+    // Append the admin's configured signature (idempotent: skipped if empty
+    // or the message already includes it). This was previously a doc/code
+    // drift — the route skipped signature append entirely.
     if (t.customer_email) {
       const body = `Hi ${t.customer_name},\n\nJust confirming we've wrapped up your request about "${t.subject}". Reply to this email if you need anything else.`;
-      await sendEmail({ to: t.customer_email, subject: `Re: ${t.subject}`, text: body });
+      const { text, html } = appendSignature(app.db, body);
+      await sendEmail({ to: t.customer_email, subject: `Re: ${t.subject}`, text, html });
     }
 
     // Best-effort: mark the original Gmail thread read + apply GeekShop/Done label + archive
@@ -272,7 +343,7 @@ Reply with just the draft text, no preamble.`;
     if (t.source === 'email' && t.source_message_id) {
       gmail = await markThreadDone(t.source_message_id);
       if (gmail.ok) {
-        app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'gmail.thread.archived', ?)").run(req.params.id);
+        logAudit(app.db, 'gmail.thread.archived', req.params.id);
       }
     }
 
@@ -304,8 +375,11 @@ Reply with just the draft text, no preamble.`;
       'INSERT INTO ticket_messages (ticket_id, sender, body) VALUES (?, ?, ?)'
     ).run(req.params.id, 'admin', body.trim());
     app.db.prepare('UPDATE tickets SET last_message_at = CURRENT_TIMESTAMP WHERE id = ?').run(req.params.id);
-    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.email_reply', ?)")
-      .run(req.params.id, JSON.stringify({ sent: true, sent_to: t.customer_email, had_signature: Boolean(html) }));
+    logAudit(app.db, 'ticket.email_reply', req.params.id, {
+      sent: true,
+      sent_to: t.customer_email,
+      had_signature: Boolean(html),
+    });
 
     return { ok: true, sent: true, sent_to: t.customer_email };
   });
@@ -350,14 +424,17 @@ Reply with just the draft text, no preamble.`;
     app.db.prepare(
       "UPDATE tickets SET status = 'resolved', resolved_at = CURRENT_TIMESTAMP, last_message_at = CURRENT_TIMESTAMP WHERE id = ?"
     ).run(req.params.id);
-    app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'ticket.resolve_with_reply', ?)")
-      .run(req.params.id, JSON.stringify({ sent: true, sent_to: t.customer_email, had_signature: Boolean(html) }));
+    logAudit(app.db, 'ticket.resolve_with_reply', req.params.id, {
+      sent: true,
+      sent_to: t.customer_email,
+      had_signature: Boolean(html),
+    });
     // 4. Best-effort: archive the Gmail thread
     let gmail = null;
     if (t.source === 'email' && t.source_message_id) {
       gmail = await markThreadDone(t.source_message_id);
       if (gmail.ok) {
-        app.db.prepare("INSERT INTO audit_log (actor, action, target) VALUES ('admin', 'gmail.thread.archived', ?)").run(req.params.id);
+        logAudit(app.db, 'gmail.thread.archived', req.params.id);
       }
     }
 

@@ -1,0 +1,35 @@
+{
+  "task_uid": "T-79EB14",
+  "subject": "invoice line not added or totalled when adding an hour service",
+  "request_payload": {
+    "line_items": [
+      {
+        "description": "Hourly Service Test",
+        "quantity": 1,
+        "unit_price_cents": 10000,
+        "taxable": true,
+        "tax_rate_id": null
+      }
+    ]
+  },
+  "response": {
+    "subtotal_cents": 10000,
+    "tax_lines": [
+      {
+        "label": "GST",
+        "rate": 0.05,
+        "amount_cents": 500
+      },
+      {
+        "label": "PST",
+        "rate": 0.07,
+        "amount_cents": 700
+      }
+    ],
+    "tax_cents": 1200,
+    "total_cents": 11200,
+    "tax_model_key": "gst_pst_bc",
+    "tax_model_label": "BC: GST 5% + PST 7%"
+  },
+  "interpretation": "User reported total=$100 instead of $100+$12 tax=$112. After fix: total_cents=11200 ($112.00) \u2014 bug is gone."
+}
