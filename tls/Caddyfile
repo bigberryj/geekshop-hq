@@ -1,0 +1,63 @@
+# Caddyfile — GeekShop HQ HTTPS front
+#
+# Why this exists: Tailscale HTTPS cert provisioning and `tailscale serve`
+# are not enabled on this tailnet (admin-gated). The HQ frontend is
+# served over plain HTTP on :5173, and the browser refuses to grant
+# `navigator.mediaDevices.getUserMedia()` (and a couple other modern
+# APIs) from non-secure contexts. We solve this by terminating TLS
+# locally with Caddy on :8443 using a self-signed CA + leaf cert that
+# covers the Tailscale hostname, the LAN hostname, and the loopback.
+#
+# BYRON: see docs/deployment.md "HTTPS for webcam capture" for the
+# one-time trust install on your Windows machine.
+{
+	# Quiet admin API; only used for `caddy reload` etc.
+	admin localhost:2019
+
+	# Don't auto-bind :80 for the HTTP→HTTPS redirect — we're running
+	# as a non-root user and don't have bind permission on :80 anyway.
+	# Clients connecting on :8443 will get HTTPS directly.
+	auto_https off
+}
+
+https://bigbai.tail136908.ts.net:8443,
+https://bigbai.lan:8443,
+https://100.96.13.84:8443,
+https://192.168.1.168:8443,
+https://localhost:8443,
+https://127.0.0.1:8443 {
+	tls /home/byron/projects/geekshop-hq/tls/hq-server.crt /home/byron/projects/geekshop-hq/tls/hq-server.key {
+		# We pre-generated the cert with our internal CA; Caddy is just
+		# doing the TLS termination. No ACME challenge required.
+		client_auth off
+	}
+
+	# Health check shortcut (used by Tailscale funnel / monitor probes)
+	@health path /api/health
+	handle @health {
+		reverse_proxy 127.0.0.1:5050
+	}
+
+	# Everything under /api goes to the Fastify backend
+	@api path /api/*
+	handle @api {
+		reverse_proxy 127.0.0.1:5050
+	}
+
+	# Vite dev server has its own SPA history-fallback; we just proxy
+	# whatever it can't resolve to index.html.
+	reverse_proxy 127.0.0.1:5173
+}
+
+# Optional: also offer plain HTTP on 8181 for backwards compat.
+# (Port 8080 is taken on this box by another service.)
+# Same proxy rules, no TLS. Byron can hit this if he's too lazy to
+# trust the CA; getUserMedia won't work over this but the rest of the
+# app will.
+:8181 {
+	@api path /api/*
+	handle @api {
+		reverse_proxy 127.0.0.1:5050
+	}
+	reverse_proxy 127.0.0.1:5173
+}

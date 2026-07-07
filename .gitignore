@@ -12,3 +12,10 @@ coverage/
 .DS_Store
 
 data/backups/
+
+# TLS private keys (CA + leaf). Public certs (hq-ca.crt, hq-server.crt,
+# Caddyfile) ARE committed so others can reproduce the trust model.
+tls/*.key
+tls/*.csr
+tls/*.srl
+data/caddy/

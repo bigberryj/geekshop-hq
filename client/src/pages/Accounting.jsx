@@ -63,6 +63,29 @@ function ReceiptCapture({ onCapture, disabled }) {
   const [err, setErr] = useState('');
   const fileRef = useRef(null);
 
+  // Why this matters: getUserMedia() is gated behind a "secure context".
+  // Browsers consider a page secure only if it's HTTPS or served from
+  // localhost / 127.0.0.1 / ::1. Our Tailscale URL is HTTP and a
+  // non-loopback hostname, so the browser will refuse with a confusing
+  // "browser does not support webcam capture" message even though
+  // Chromium absolutely supports it. Detect this up front and show a
+  // concrete remediation (use the HTTPS Tailscale URL) instead of
+  // waiting for the user to click and get a cryptic error.
+  //
+  // Once `tailscale serve` is configured (see docs/deployment.md), the
+  // Tailscale URL serves HTTPS automatically and isSecureContext is
+  // true everywhere in the tailnet.
+  const supportsWebcam = typeof navigator !== 'undefined'
+    && !!navigator.mediaDevices
+    && typeof navigator.mediaDevices.getUserMedia === 'function';
+  const secureContext = typeof window !== 'undefined' && window.isSecureContext === true;
+  const webcamAvailable = supportsWebcam && secureContext;
+  const webcamBlockReason = !supportsWebcam
+    ? 'This browser does not expose navigator.mediaDevices.'
+    : !secureContext
+      ? `This page is not loaded over HTTPS (you're at ${typeof window !== 'undefined' ? window.location.protocol : 'unknown:'}//${typeof window !== 'undefined' ? window.location.hostname : 'unknown'}). Browsers only allow camera access on HTTPS pages or localhost. Open the HTTPS Tailscale URL (see docs/deployment.md) and webcam capture will work.`
+      : '';
+
   // Tear down the stream whenever this component unmounts. Critical
   // for not leaving the camera light on after the modal closes.
   useEffect(() => {
@@ -72,12 +95,19 @@ function ReceiptCapture({ onCapture, disabled }) {
 
   const startCamera = async () => {
     setErr('');
+    // Re-check at click-time in case the user navigated between render
+    // and click (e.g. they switched tabs and back).
+    if (!supportsWebcam) {
+      setErr('This browser does not support webcam capture. Try the latest Chrome, Edge, Firefox, or Safari.');
+      return;
+    }
+    if (!secureContext) {
+      setErr(webcamBlockReason);
+      return;
+    }
     setStarting(true);
     setCaptured(null);
     try {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        throw new Error('This browser does not support webcam capture.');
-      }
       const s = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
         audio: false,
@@ -91,7 +121,23 @@ function ReceiptCapture({ onCapture, disabled }) {
         }
       }, 0);
     } catch (e) {
-      setErr(e?.message || 'Could not access the webcam.');
+      // Surface the most likely human causes in plain language, with
+      // the raw DOMException name in parentheses for the dev console.
+      const name = e?.name || '';
+      const msg = e?.message || 'Could not access the webcam.';
+      let friendly = msg;
+      if (name === 'NotAllowedError' || /denied|permission/i.test(msg)) {
+        friendly = 'Camera access was blocked. Click the camera icon in your browser\u2019s address bar and allow camera access for this site, then try again.';
+      } else if (name === 'NotFoundError' || /device|not found/i.test(msg)) {
+        friendly = 'No camera was found on this device. Make sure your webcam is plugged in (or that no other app is using it exclusively) and try again.';
+      } else if (name === 'NotReadableError' || /in use|busy/i.test(msg)) {
+        friendly = 'The camera is in use by another application. Close other apps that might be using the webcam and try again.';
+      } else if (name === 'OverconstrainedError') {
+        friendly = 'No camera on this device matches the resolution we asked for. A basic laptop webcam should still work \u2014 reload the page to retry.';
+      } else if (name === 'SecurityError' || /secure/i.test(msg)) {
+        friendly = webcamBlockReason || msg;
+      }
+      setErr(`${friendly} (${name || 'error'})`);
     } finally {
       setStarting(false);
     }
@@ -159,7 +205,8 @@ function ReceiptCapture({ onCapture, disabled }) {
             type="button"
             className="btn-secondary"
             onClick={startCamera}
-            disabled={disabled || starting}
+            disabled={disabled || starting || !webcamAvailable}
+            title={!webcamAvailable ? webcamBlockReason : undefined}
             data-testid="expense-receipt-start-camera"
           >
             <Camera size={14} /> {starting ? 'Starting…' : 'Use webcam'}
@@ -176,6 +223,13 @@ function ReceiptCapture({ onCapture, disabled }) {
               data-testid="expense-receipt-file-input"
             />
           </label>
+        </div>
+      )}
+
+      {!stream && !captured && !webcamAvailable && (
+        <div className="flex items-start gap-1.5 text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2">
+          <AlertTriangle size={14} className="mt-0.5 flex-shrink-0" />
+          <span>{webcamBlockReason} You can still attach a receipt using <strong>Pick image / PDF</strong> above.</span>
         </div>
       )}
 

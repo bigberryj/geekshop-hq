@@ -841,6 +841,89 @@ Phase 1 of [`docs/plans/2026-06-29-geekshop-hq-accounting-roadmap.md`](./plans/2
 
 No QuickBooks sync direction was added. The leakage widget reads only local data and pushes nothing outbound.
 
+## 2026-06-30 — Phase 4 Expense / receipt capture + webcam (T-74ED50)
+
+Phase 4 of [`docs/plans/2026-06-29-geekshop-hq-accounting-roadmap.md`](./plans/2026-06-29-geekshop-hq-accounting-roadmap.md). Adds local expense tracking with vendor, date, category, integer-cent subtotal/tax/total, payment method, optional receipt attachment, and notes; and a webcam-friendly receipt capture path that uses the browser's own `getUserMedia` so a receipt can be snapped straight into the expense row from a laptop webcam or phone camera.
+
+**What shipped**
+
+- **Database (migration `031_accounting.sql` already created `expenses`, `expense_categories`, and `expense_attachments` in the prior accounting MVP tick; Phase 4 added row + receipt endpoints, validation, and DB-level CHECK hardening in `035_expense_amount_checks.sql`).**
+  - `expenses` row holds: vendor, `expense_date` (YYYY-MM-DD), `category_id` → `expense_categories`, `amount_cents` (non-negative integer), `tax_cents` (non-negative integer, ≤ `amount_cents`), `tax_rate_id` → `tax_rates`, `payment_method` (free string ≤ 64 chars), `business_use` (boolean), `receipt_path` (relative path under `data/attachments/expenses/<id>/`, nullable), `notes` (free text), `created_at`, `updated_at`.
+  - `expense_attachments` row holds: `expense_id` → `expenses.id` (CASCADE delete), original filename, mime, size, sha256, stored path.
+  - DB CHECK constraints (`035_expense_amount_checks.sql`) reject `amount_cents < 0`, `tax_cents < 0`, and `tax_cents > amount_cents` — defense in depth so a future import path that bypasses the zod parse still cannot write garbage.
+
+- **REST endpoints (all admin-only via the existing `requireAdmin` gate):**
+  - `GET /api/accounting/expense-categories` / `POST` — category CRUD joined with `tax_rates`.
+  - `GET /api/accounting/expenses?from=&to=&category_id=&vendor=` — list with filters, joined to category, capped at 500 rows.
+  - `POST /api/accounting/expenses` — create (zod-validated; cents-only fields).
+  - `PUT /api/accounting/expenses/:id` — partial update (zod `.partial()`).
+  - `DELETE /api/accounting/expenses/:id` — row + attachment file (ENOENT-tolerant).
+  - `POST /api/accounting/expenses/:id/receipt` — multipart upload, content-sniff + declared mime allowlist (`image/png`, `image/jpeg`, `image/webp`, `application/pdf`), 25 MB business cap, audit row on every accept/reject.
+  - `GET /api/accounting/expenses/:id/receipt` — streams the file (admin-only); path-traversal blocked by `resolveAttachmentPath()`.
+  - `DELETE /api/accounting/expenses/:id/receipt` — removes the file and clears `receipt_path`; audit row.
+
+- **Filesystem:** receipts persist under `data/attachments/expenses/<expense_id>/<sha256-prefix>-<safe-filename>` (or `$GHQ_ATTACHMENT_ROOT` in tests). **Never** under `client/`, `public/`, or any webroot. No static route serves attachments — receipts are streamed only by the admin-gated handler. Filename in the API response is the *original* name; the on-disk name is the SHA-256 prefix + sanitized original for collision-safety.
+
+- **Frontend (`Accounting.jsx` → Expenses tab):**
+  - `ExpenseEditor` modal with vendor, date, category, amount, tax, payment method, business-use toggle, notes, and receipt section.
+  - **Receipt capture** component (`ReceiptCapture`) with two entry points:
+    1. **Use webcam** — `navigator.mediaDevices.getUserMedia({video: {facingMode: 'environment', ...}})` → live `<video>` preview → "Snap receipt" → `canvas.toBlob()` at JPEG q=0.85 → uploaded as the receipt. Camera light is freed the moment the snapshot is captured (track `.stop()` on every `MediaStreamTrack`).
+    2. **Pick image / PDF** — `<input type=file accept="image/*,application/pdf">` fallback (works on every URL, including HTTP Tailscale).
+  - Pre-flight detection of `window.isSecureContext` — if the page is HTTP and not loopback, the *Use webcam* button is disabled and an amber banner explains *why* (and points at the HTTPS URL). This replaces the cryptic `SecurityError` you used to get for clicking the button on a non-secure page.
+  - Friendly per-error messages for `NotAllowedError` (browser blocked the permission), `NotFoundError` (no camera on this device), `NotReadableError` (camera in use by another app), `OverconstrainedError`, and `SecurityError` — including the raw `DOMException` name in parentheses for the dev console.
+  - Live frame rendering, retake button, "Snap receipt" → preview → "Use this photo" → upload → row updates inline.
+
+- **HTTPS plumbing (`tls/` + `start-with-tls.sh`):** because the browser only grants `getUserMedia` from a secure context, and the tailnet does not have `tailscale serve` enabled, this tick added a local Caddy HTTPS terminator on `:8443` with a self-signed CA + leaf cert that covers the Tailscale hostname, LAN hostname, and loopback. `bash start-with-tls.sh` starts backend + Vite + Caddy. UFW allows `8443/tcp on tailscale0`. The first-time Windows trust install is one double-click on `tls/hq-ca.crt` — see `docs/deployment.md` and `tls/README.md`. `vite.config.js` was extended with an `allowedHosts` list so proxied requests from the HTTPS front are not blocked by Vite's host-allow check.
+
+- **Audit log:** every receipt upload, rejection, delete, and download writes a single `audit_log` row with `action` and `target=<expense_id>` so the receipt lifecycle is traceable. The `receipt_rejected` event includes the declared mime, the rejection code (`TYPE_MISMATCH`, `CONTENT_UNKNOWN`, `CONTEXT_DENIED`), and the size — but never the offending bytes.
+
+- **Backups:** `data/backups/hq-pre-phase4-2026-06-29T22-34-51-915Z.db` and `hq-pre-phase4-verify-20260630T172228Z.db` were captured before any receipt-path migration testing. Migration `035` is forward-only additive on the existing `expenses` table.
+
+- **Tests:** 26 vitest cases in `test/phase4-expenses.test.js` covering: create / list / update / delete on `/api/accounting/expenses`; category CRUD; `from`/`to`/`category_id`/`vendor` filters; `tax_cents > amount_cents` rejection at the route AND at the DB layer; declared-mime vs sniffed-mime mismatch (`text/html` claimed as `image/png` → 415 `TYPE_MISMATCH`); random-bytes rejection (`CONTENT_UNKNOWN`); oversize payload → 413 with `max_bytes` echoed (size NOT echoed); receipt upload + GET round-trip (byte-for-byte); receipt DELETE removes both the row field AND the file on disk; `resolveAttachmentPath()` blocks path-traversal; forged `receipt_path` value in DB → 404 on GET; admin gate enforced.
+
+- **Docs updated:**
+  - `docs/schema.md` — `expenses` table block, `expense_attachments`, receipt storage notes, `035` CHECK constraints.
+  - `docs/api.md` — expense CRUD + `/receipt` endpoints.
+  - `docs/security.md` — Phase 4 admin gate + content sniff + audit log + path-traversal defense.
+  - `docs/deployment.md` — new "HTTPS for webcam capture (Phase 4)" section with the Caddy + Windows-trust workflow.
+  - `tls/README.md` — full trust model, regenerating certs, Firefox notes.
+  - `docs/changelog.md` — this entry.
+
+**Verification**
+
+- `cd server && npm test -- test/phase4-expenses.test.js` — **26/26 green** on every run.
+- `cd client && npm run build` — clean (1,687 modules, 647 kB main chunk, 34.77 kB CSS, ~4.8 s).
+- Full server suite — 476/498 green. The 22 failures (`tax-summary-enhanced` 18, `google-contacts` 2 (OAuth token missing), `phase6-export` 1, `accounting-extra` Stripe verifyWebhook 1) are pre-existing and unrelated to Phase 4 — they live in the tax-summary, Google Contacts, and Stripe paths that were never touched by this work.
+- Browser verification (`data/evidence/phase4plus/browser-verification.md`): ReceiptCapture component mounted inside `ExpenseEditor`, button renders correctly, click on `Use webcam` in headless Chromium returns `Requested device not found` (expected — no camera in headless) and the component surfaces the friendly message; file-picker path with a webcam-shaped filename (`receipt-YYYYMMDD-HHMMSS.jpg`) round-trips through the API (200 OK, file on disk, audit row, served back byte-for-byte via `GET /receipt`).
+- Caddy + cert verified independently: `curl -k https://localhost:8443/api/health` returns 200 over TLS with HSTS, `curl -k https://bigbai.tail136908.ts.net:8443/` returns 200 with the React app, and the SAN list on the leaf cert covers `bigbai.tail136908.ts.net`, `bigbai`, `100.96.13.84`, `bigbai.lan`, `192.168.1.168`, `localhost`, `127.0.0.1`.
+
+**Why webcam still requires one user step**
+
+`getUserMedia()` is a secure-context API. The Caddy front is wired up and tested, but Byron's Windows laptop does **not** trust our self-signed CA yet — so Chrome refuses to load `https://bigbai.tail136908.ts.net:8443/accounting` without the "Not secure" interstitial, and even after clicking through, the camera permission is denied because the connection isn't trusted. The one-time install on Byron's machine is:
+
+```powershell
+scp bigbai:projects/geekshop-hq/tls/hq-ca.crt $env:USERPROFILE\Downloads\
+# double-click hq-ca.crt -> Install Certificate -> Local Machine
+#   -> Trusted Root Certification Authorities -> Finish
+# restart Chrome / Edge
+```
+
+After that, `https://bigbai.tail136908.ts.net:8443/accounting` opens cleanly, the page is secure, *Use webcam* is enabled, the camera permission prompt appears once, and the snap → preview → upload flow runs end-to-end.
+
+**Files touched**
+
+- `server/routes/accounting.js` — expense + receipt endpoints (~500 lines including zod schemas, content-sniff + declared-mime allowlist, audit, path-traversal guard).
+- `server/lib/attachments.js` — extended receipt helpers (size cap, mime allowlist, sha256-prefixed storage, resolveAttachmentPath).
+- `server/db/migrations/035_expense_amount_checks.sql` — defensive CHECK constraints on `expenses`.
+- `client/src/pages/Accounting.jsx` — `ReceiptCapture` component (webcam + file picker), `ExpenseEditor` modal, list view, wiring into the Expenses tab.
+- `client/vite.config.js` — `allowedHosts` for Tailscale / LAN hostnames so proxied HTTPS requests aren't 403-blocked by Vite.
+- `tls/Caddyfile`, `tls/generate-certs.sh`, `tls/hq.cnf`, `tls/hq-ca.crt`, `tls/hq-server.crt`, `tls/README.md`, `start-with-tls.sh` — HTTPS terminator + cert generation + first-time-trust docs.
+- `docs/deployment.md` — HTTPS-for-webcam section.
+- `docs/security.md` — Phase 4 audit and hardening notes.
+- `docs/schema.md` — `expenses` + `expense_attachments` tables.
+- `docs/api.md` — expense + receipt endpoint reference.
+- `docs/changelog.md` — this entry.
+
 ## 2026-06-29 — Mobile-friendly responsive UX pass (T-F0FA30)
 
 The HQ admin surface had usable but cramped mobile behavior — the Inbox Gmail review queue overflowed horizontally inside its card, Mission Control's status tiles wrapped to an awkward 3+3+1, and Money truncated tax-model names. This pass audited every priority surface at iPhone-12 viewport (390×844) and fixed the actual offenders with minimal CSS-class additions. No new dependencies, no framework changes.
